@@ -3,6 +3,7 @@ module github.com/gofsd/libp2p-pebble-raft
 go 1.25.9
 
 require (
+	github.com/Masterminds/semver/v3 v3.5.0
 	github.com/libp2p/go-libp2p v0.48.0
 	github.com/libp2p/go-libp2p-kad-dht v0.40.0
 	github.com/magefile/mage v1.17.2

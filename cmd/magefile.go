@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"github.com/gofsd/libp2p-pebble-raft/pkg/raft"
-	"github.com/magefile/mage/mg"
 )
 
 // Relay starts the libp2p Relay and Signaling server
@@ -52,29 +51,6 @@ func Client(relayAddr string, targetPeerID string, keyPath string) error {
 	ch := make(chan os.Signal, 1)
 	signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM)
 	<-ch
-	return nil
-}
-
-// Build compiles the project for multiple platforms
-func Build() {
-	mg.Deps(BuildLinux, BuildWindows, BuildAndroid)
-}
-
-func BuildLinux() error {
-	fmt.Println("Building for Linux...")
-	// Implementation for go build...
-	return nil
-}
-
-func BuildWindows() error {
-	fmt.Println("Building for Windows...")
-	// Implementation for go build...
-	return nil
-}
-
-func BuildAndroid() error {
-	fmt.Println("Building Android AAR...")
-	// Implementation for gomobile bind...
 	return nil
 }
 
