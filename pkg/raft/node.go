@@ -63,7 +63,7 @@ func StartRelayNode(ctx context.Context, keyPath string, port int) (*RelayNode, 
 
 	h, err := libp2p.New(
 		libp2p.Identity(priv),
-		libp2p.ListenAddrStrings(fmt.Sprintf("/ip4/127.0.0.1/tcp/%d", port)),
+		libp2p.ListenAddrStrings(fmt.Sprintf("/ip4/0.0.0.0/tcp/%d", port)),
 		libp2p.DefaultTransports,
 		libp2p.ForceReachabilityPublic(),
 		libp2p.EnableRelayService(v2relay.WithResources(rc)),

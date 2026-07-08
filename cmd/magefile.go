@@ -80,7 +80,7 @@ func TestP2PRelay() error {
 
 	// ── Step 1: Relay ───────────────────────────────
 	fmt.Println("\n[1/4] Starting relay node (port 0 = ephemeral)…")
-	relay, err := raft.StartRelayNode(ctx, filepath.Join(tmpDir, "relay.key"), 0)
+	relay, err := raft.StartRelayNode(ctx, filepath.Join(tmpDir, "relay.key"), 4001)
 	if err != nil {
 		return fmt.Errorf("relay start failed: %w", err)
 	}
@@ -131,4 +131,113 @@ func TestP2PRelay() error {
 	fmt.Printf("\n✓ PASS — response: %q\n", response)
 	fmt.Println("════════════════════════════════════════")
 	return nil
+}
+
+// StartRelay starts a standalone Circuit Relay v2 node.
+// Usage: mage startrelay
+func StartRelay() error {
+	ctx, cancel := setupSignalContext()
+	defer cancel()
+
+	tmpDir := os.TempDir()
+	keyPath := filepath.Join(tmpDir, "mage_relay.key")
+
+	fmt.Println("📡 Starting standalone Relay Node...")
+	relay, err := raft.StartRelayNode(ctx, keyPath, 4001)
+	if err != nil {
+		return fmt.Errorf("failed to start relay: %w", err)
+	}
+	defer relay.Host.Close()
+
+	if len(relay.Addrs) == 0 {
+		return fmt.Errorf("relay generated no addresses")
+	}
+
+	fmt.Fprintln(os.Stderr, "\n=======================================================")
+	fmt.Printf("🚀 RELAY IS RUNNING\n")
+	fmt.Printf("Relay PeerID: %s\n", relay.Host.ID().String())
+	fmt.Printf("Relay Address (Copy this!):\n%s\n", relay.Addrs[0])
+	fmt.Fprintln(os.Stderr, "=======================================================")
+	fmt.Println("\nPress Ctrl+C to stop...")
+
+	<-ctx.Done()
+	fmt.Println("\nStopping Relay Node...")
+	return nil
+}
+
+// StartEchoServer starts Client 1, which connects to the relay and listens for pings.
+// Usage: mage startechoserver <relay_multiaddr>
+func StartEchoServer(relayAddr string) error {
+	if relayAddr == "" {
+		return fmt.Errorf("missing required argument: relay_multiaddr")
+	}
+
+	ctx, cancel := setupSignalContext()
+	defer cancel()
+
+	tmpDir := os.TempDir()
+	keyPath := filepath.Join(tmpDir, "mage_client1.key")
+
+	fmt.Printf("🟢 Connecting Client 1 (Echo Server) to relay: %s\n", relayAddr)
+	client1, err := raft.NewP2PNode(ctx, relayAddr, keyPath)
+	if err != nil {
+		return fmt.Errorf("failed to start client1: %w", err)
+	}
+	defer client1.Close()
+
+	client1.SetEchoHandler()
+
+	fmt.Fprintln(os.Stderr, "\n=======================================================")
+	fmt.Printf("🖥️  ECHO SERVER IS ONLINE\n")
+	fmt.Printf("Client 1 PeerID: %s\n", client1.Host.ID().String())
+	fmt.Fprintln(os.Stderr, "=======================================================")
+	fmt.Println("\nListening for messages... Press Ctrl+C to stop.")
+
+	<-ctx.Done()
+	fmt.Println("\nStopping Echo Server...")
+	return nil
+}
+
+// SendPing starts Client 2, connects via the relay, sends a message to Client 1, and exits.
+// Usage: mage sendping <relay_multiaddr> <relay_peer_id> <client1_peer_id> <message>
+func SendPing(relayAddr, relayID, client1ID, message string) error {
+	if relayAddr == "" || relayID == "" || client1ID == "" || message == "" {
+		return fmt.Errorf("missing arguments. Usage: mage sendping <relay_multiaddr> <relay_id> <client1_id> <message>")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	tmpDir := os.TempDir()
+	keyPath := filepath.Join(tmpDir, "mage_client2.key")
+
+	fmt.Println("🔵 Initializing Client 2 (Sender)...")
+	client2, err := raft.NewP2PNode(ctx, relayAddr, keyPath)
+	if err != nil {
+		return fmt.Errorf("failed to start client2: %w", err)
+	}
+	defer client2.Close()
+
+	fmt.Printf("✉️  Sending via Relay -> To Client 1: %q\n", message)
+	response, err := client2.SendAndReceive(ctx, relayID, client1ID, message)
+	if err != nil {
+		return fmt.Errorf("SendAndReceive failed: %w", err)
+	}
+
+	fmt.Fprintln(os.Stderr, "\n=======================================================")
+	fmt.Printf("✅ RESPONSE RECEIVED: %s\n", response)
+	fmt.Fprintln(os.Stderr, "=======================================================")
+
+	return nil
+}
+
+func setupSignalContext() (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(context.Background())
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sigChan
+		cancel()
+	}()
+	return ctx, cancel
 }

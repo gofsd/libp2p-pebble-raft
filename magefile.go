@@ -8,10 +8,14 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"github.com/Masterminds/semver/v3"
 	"github.com/magefile/mage/mg"
+	"github.com/magefile/mage/sh"
+
+	"github.com/gofsd/libp2p-pebble-raft/pkg/kvctl"
 )
 
 // Default target to run if none is specified
@@ -243,4 +247,204 @@ func BuildAndroid() error {
 	fmt.Println("Building Android AAR...")
 	// Implementation for gomobile bind...
 	return nil
+}
+
+// BuildAndRunDocker builds the relay image and recreates the container if it already exists.
+// Usage: mage buildandrundocker
+func BuildAndRunDocker() error {
+	const (
+		imageName     = "p2p-relay-app"
+		containerName = "p2p-relay-container"
+	)
+
+	fmt.Println("🐳 Checking for existing Docker container...")
+
+	// Check if the container exists (running or stopped)
+	// 'docker ps -a -q' returns the container ID if found, or empty string if not
+	id, _ := sh.Output("docker", "ps", "-a", "-q", "-f", "name=^/"+containerName+"$")
+
+	if id != "" {
+		fmt.Printf("🔄 Found existing container (%s). Recreating...\n", containerName)
+
+		// Stop the container if it's currently running
+		_ = sh.Run("docker", "stop", containerName)
+
+		// Remove the old container
+		if err := sh.Run("docker", "rm", containerName); err != nil {
+			return fmt.Errorf("failed to remove old container: %w", err)
+		}
+		fmt.Println("🗑️  Old container removed successfully.")
+	}
+
+	// 1. Build the new Docker image from the current directory
+	fmt.Printf("🛠️  Building Docker image: %s...\n", imageName)
+	if err := sh.RunV("docker", "build", "-t", imageName, "."); err != nil {
+		return fmt.Errorf("docker build failed: %w", err)
+	}
+
+	// 2. Run the new container in detached mode (-d)
+	fmt.Printf("🚀 Launching new container: %s...\n", containerName)
+	if err := sh.RunV("docker", "run", "-d", "--name", containerName, "-p", "4001:4001", imageName); err != nil {
+		return fmt.Errorf("failed to run new docker container: %w", err)
+	}
+
+	fmt.Fprintln(os.Stderr, "\n=======================================================")
+	fmt.Println("✅ Relay container is running in the background!")
+	fmt.Println("👉 To view the live logs & Multiaddr, run:")
+	fmt.Printf("   docker logs %s\n", containerName)
+	fmt.Println("👉 To read the relay.txt file from inside the container, run:")
+	fmt.Printf("   docker exec %s cat relay.txt\n", containerName)
+	fmt.Fprintln(os.Stderr, "=======================================================")
+
+	return nil
+}
+
+// BuildAndRunPodman builds the relay image and recreates the container using Podman.
+// Usage: mage buildandrunpodman
+func BuildAndRunPodman() error {
+	const (
+		imageName     = "localhost/p2p-relay-app"
+		containerName = "p2p-relay-container"
+	)
+
+	fmt.Println("🦭 Checking for existing Podman container...")
+
+	// Check if the container exists (running or stopped)
+	// 'podman ps -a -q' returns the container ID if found
+	id, _ := sh.Output("podman", "ps", "-a", "-q", "-f", "name=^/"+containerName+"$")
+
+	if id != "" {
+		fmt.Printf("🔄 Found existing container (%s). Recreating...\n", containerName)
+
+		// Stop the container if it's currently running
+		_ = sh.Run("podman", "stop", containerName)
+
+		// Remove the old container
+		if err := sh.Run("podman", "rm", containerName); err != nil {
+			return fmt.Errorf("failed to remove old container: %w", err)
+		}
+		fmt.Println("🗑️  Old container removed successfully.")
+	}
+
+	// 1. Build the new Podman image from the current directory
+	fmt.Printf("🛠️  Building Podman image: %s...\n", imageName)
+	if err := sh.RunV("podman", "build", "-t", imageName, "."); err != nil {
+		return fmt.Errorf("podman build failed: %w", err)
+	}
+
+	// 2. Run the new container in detached mode (-d)
+	fmt.Printf("🚀 Launching new container: %s...\n", containerName)
+	fmt.Printf("🚀 Launching new container using Host Networking: %s...\n", containerName)
+	if err := sh.RunV("podman", "run", "-d", "--name", containerName, "--net=host", imageName); err != nil {
+		return fmt.Errorf("failed to run new podman container: %w", err)
+	}
+
+	fmt.Fprintln(os.Stderr, "\n=======================================================")
+	fmt.Println("✅ Relay container is running via Podman in the background!")
+	fmt.Println("👉 To view the live logs & Multiaddr, run:")
+	fmt.Printf("   podman logs %s\n", containerName)
+	fmt.Println("👉 To read the relay.txt file from inside the container, run:")
+	fmt.Printf("   podman exec %s cat relay.txt\n", containerName)
+	fmt.Fprintln(os.Stderr, "=======================================================")
+
+	return nil
+}
+
+// Shell attaches an interactive terminal to the running relay container.
+// Usage: mage shell
+func Shell() error {
+	const containerName = "p2p-relay-container"
+
+	// Determine if we should use podman or docker based on what is installed/running
+	runtime := "docker"
+	if _, err := sh.Output("podman", "--version"); err == nil {
+		runtime = "podman"
+	}
+
+	fmt.Printf("🐚 Attaching interactive shell into %s (%s)...\n", containerName, runtime)
+	fmt.Println("👉 Type 'exit' to disconnect without stopping the relay.")
+	fmt.Println("-------------------------------------------------------")
+
+	// sh.RunV automatically handles tying os.Stdin, os.Stdout, and os.Stderr
+	// to your terminal so interactive CLI commands work perfectly.
+	return sh.RunV(runtime, "exec", "-it", containerName, "/bin/sh")
+}
+
+// AddNode spawns a new node process and bootstraps it as the cluster's sole
+// leader. mage requires every target to take a fixed number of arguments
+// (no optional/variadic CLI args), so the three addnode shapes described in
+// the project's design (0, 1, or 2 peer-id arguments) are exposed as three
+// targets -- AddNode, AddFollower, RejoinNode -- that all delegate to the
+// same underlying kvctl.AddNode(repoRoot, peerIDs...).
+//
+// Usage: mage addnode
+func AddNode() error {
+	return runAddNode()
+}
+
+// AddFollower spawns a new node process and joins it to the cluster led by
+// leaderPeerID.
+//
+// Usage: mage addfollower <leaderPeerID>
+func AddFollower(leaderPeerID string) error {
+	return runAddNode(leaderPeerID)
+}
+
+// RejoinNode restarts the existing node ownPeerID (reusing its data
+// directory and identity) and (re)joins it to leaderPeerID. Use this to
+// bring a node back up after it went down, possibly under a new leader.
+//
+// Usage: mage rejoinnode <leaderPeerID> <ownPeerID>
+func RejoinNode(leaderPeerID, ownPeerID string) error {
+	return runAddNode(leaderPeerID, ownPeerID)
+}
+
+func runAddNode(peerIDs ...string) error {
+	root, err := repoRoot()
+	if err != nil {
+		return err
+	}
+	peerID, err := kvctl.AddNode(root, peerIDs...)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("✅ node %s is up and selected as current\n", peerID)
+	return nil
+}
+
+// Use selects which node Set/Get target, by peer id.
+// Usage: mage use <peerID>
+func Use(peerID string) error {
+	if err := kvctl.Use(peerID); err != nil {
+		return err
+	}
+	fmt.Printf("current node set to %s\n", peerID)
+	return nil
+}
+
+// Set stores key=value through raft on the current node.
+// Usage: mage set <key> <value>
+func Set(key, value string) error {
+	return kvctl.Set(key, value)
+}
+
+// Get reads key from the current node's local state.
+// Usage: mage get <key>
+func Get(key string) error {
+	value, err := kvctl.Get(key)
+	if err != nil {
+		return err
+	}
+	fmt.Println(value)
+	return nil
+}
+
+// repoRoot returns the directory this magefile lives in, so AddNode can
+// `go build ./cmd/kvnode` regardless of the directory mage was invoked from.
+func repoRoot() (string, error) {
+	_, file, _, ok := runtime.Caller(0)
+	if !ok {
+		return "", fmt.Errorf("addnode: cannot determine repo root")
+	}
+	return filepath.Dir(file), nil
 }

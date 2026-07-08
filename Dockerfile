@@ -42,5 +42,6 @@ USER p2puser
 # Expose standard libp2p connection protocols
 EXPOSE 4001/tcp 4001/udp 4002/tcp 4003/udp
 
-# Set binary as entrypoint
-ENTRYPOINT ["./p2p-app"]
+# Use an explicit shell form entrypoint to handle pipe redirecting via 'tee'
+# This runs the 'startrelay' target and writes output to relay.txt
+ENTRYPOINT ["/bin/sh", "-c", "./p2p-app startrelay 2>&1 | tee relay.txt"]
