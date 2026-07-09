@@ -19,6 +19,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -32,6 +34,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/protocol"
 	v2relay "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/relay"
 	"github.com/multiformats/go-multiaddr"
+	manet "github.com/multiformats/go-multiaddr/net"
 
 	"github.com/gofsd/libp2p-pebble-raft/pkg/ipc"
 	"github.com/gofsd/libp2p-pebble-raft/pkg/ipcproto"
@@ -44,6 +47,26 @@ import (
 // JoinProtocolID is the libp2p protocol a joining node uses to ask an
 // existing leader to add it as a voter.
 const JoinProtocolID = protocol.ID("/libp2p-pebble-raft/join/1.0.0")
+
+// ForwardProtocolID is the libp2p protocol a non-leader node uses to relay
+// a Set to the current raft leader on the caller's behalf. Needed because
+// pkg/ipc is a same-machine-only protocol -- a node has no other way to
+// reach whichever peer is actually the raft leader -- and raft itself
+// deliberately has no client-request forwarding built in; that's left to
+// the application. In particular, the Android build of this project runs
+// as a follower with no separate "find the leader" step available to its
+// UI, so every Set it issues needs this to reach the leader at all.
+const ForwardProtocolID = protocol.ID("/libp2p-pebble-raft/forward-set/1.0.0")
+
+// ForwardJoinProtocolID is the libp2p protocol a non-leader node uses to
+// relay a Join request to the current raft leader on the joining node's
+// behalf, mirroring ForwardProtocolID's role for Set and for the same
+// reason: raft leadership can move to any voter at any time -- this
+// project watched it happen mid-session -- so whichever cluster member a
+// new node was told to join through (e.g. a leader address baked into an
+// Android build at compile time) may no longer be the leader by the time
+// it actually tries.
+const ForwardJoinProtocolID = protocol.ID("/libp2p-pebble-raft/forward-join/1.0.0")
 
 // ReadyFileName is written to Config.DataDir once the daemon's host and IPC
 // server are up, so the spawning `mage addnode` can learn the node's peer id
@@ -70,6 +93,23 @@ type Config struct {
 	// (EnableRelay/EnableHolePunching are always on); this flag only
 	// controls whether it also serves as one for others.
 	RelayService bool
+
+	// RelayPeer is a known circuit-relay v2 server's multiaddr (a node
+	// running with RelayService=true) this node should proactively reserve
+	// a relay slot through, so it ends up with a /p2p-circuit address that
+	// someone can dial it on even though it has no directly-dialable
+	// address of its own -- e.g. a phone on a cellular connection behind
+	// carrier-grade NAT, which blocks *inbound* connections entirely.
+	// EnableRelay/EnableHolePunching (always on regardless of this field)
+	// only let a node *use* a relay connection someone else already set
+	// up; without a static relay target here, a node that nothing can dial
+	// directly has no way to make its own reservation, and ends up
+	// advertising only addresses that raft's leader can never use to send
+	// it AppendEntries -- leaving it permanently stuck as a voter that
+	// never learns who the leader is. Leave empty for a node with a real
+	// public or otherwise directly-dialable address, where a reservation
+	// would just be wasted overhead.
+	RelayPeer string
 
 	// Raft timing knobs. Zero means "use hashicorp/raft's own default"
 	// (1s heartbeat/election, 50ms commit, 500ms leader lease) -- values
@@ -213,6 +253,8 @@ func start(cfg Config) (*Node, error) {
 		snapStore: snapStore,
 	}
 	h.SetStreamHandler(JoinProtocolID, n.handleJoinStream)
+	h.SetStreamHandler(ForwardProtocolID, n.handleForwardSetStream)
+	h.SetStreamHandler(ForwardJoinProtocolID, n.handleForwardJoinStream)
 	return n, nil
 }
 
@@ -250,6 +292,18 @@ func newHost(priv crypto.PrivKey, cfg Config) (lp2phost.Host, error) {
 			libp2p.EnableRelayService(v2relay.WithResources(rc)),
 			libp2p.ForceReachabilityPublic(),
 		)
+	}
+
+	if cfg.RelayPeer != "" {
+		maddr, err := multiaddr.NewMultiaddr(cfg.RelayPeer)
+		if err != nil {
+			return nil, fmt.Errorf("invalid relay peer address %q: %w", cfg.RelayPeer, err)
+		}
+		info, err := peer.AddrInfoFromP2pAddr(maddr)
+		if err != nil {
+			return nil, fmt.Errorf("relay peer address %q missing peer id: %w", cfg.RelayPeer, err)
+		}
+		opts = append(opts, libp2p.EnableAutoRelayWithStaticRelays([]peer.AddrInfo{*info}))
 	}
 
 	return libp2p.New(opts...)
@@ -337,12 +391,84 @@ func (n *Node) shutdown() {
 
 // advertisedAddrs returns this node's dialable multiaddrs, each including a
 // trailing /p2p/<peer-id> component.
+// advertisedAddrs returns this node's own dialable addresses, best first:
+// this is what gets baked into raft's persisted cluster configuration
+// (index [0], for both a bootstrapping leader's own address and a joining
+// follower's self-reported address) and what a peer that has never
+// connected to this node before -- e.g. after a restart tears down any
+// existing connection -- has to work with to dial it fresh.
+//
+// n.host.Addrs() carries no ordering guarantee that favors reachability, so
+// a multi-homed host (a VPS with both a public IP and a private/VPN
+// interface, like the one this project targets for a real remote
+// deployment) can easily end up with a private address in [0] purely by
+// interface enumeration order. That address is often not just suboptimal
+// but entirely undialable by anyone outside that private network -- and
+// unlike the peerstore, which can accumulate additional observed addresses
+// from a successful connection, raft's configuration stores exactly one
+// address per voter, so getting it wrong here is not recoverable by any
+// other layer once persisted. Sort public addresses first, then
+// private/unspecified, then loopback last (only useful for same-machine
+// setups, and worse than everything else for a real multi-host one).
 func (n *Node) advertisedAddrs() []string {
-	addrs := make([]string, 0, len(n.host.Addrs()))
-	for _, a := range n.host.Addrs() {
+	hostAddrs := n.host.Addrs()
+
+	const (
+		scorePublic = iota
+		scoreRelay
+		scoreOther
+		scoreLoopback
+	)
+	score := func(a multiaddr.Multiaddr) int {
+		switch {
+		case manet.IsPublicAddr(a):
+			return scorePublic
+		// A /p2p-circuit address is a relay reservation (see Config.RelayPeer):
+		// unlike a raw private/NAT address, it's actually dialable by
+		// whoever needs to reach this node, so it belongs ahead of the
+		// "other" tier even though it isn't a direct address either.
+		case strings.Contains(a.String(), "/p2p-circuit"):
+			return scoreRelay
+		case manet.IsIPLoopback(a):
+			return scoreLoopback
+		default:
+			return scoreOther
+		}
+	}
+	sorted := make([]multiaddr.Multiaddr, len(hostAddrs))
+	copy(sorted, hostAddrs)
+	sort.SliceStable(sorted, func(i, j int) bool { return score(sorted[i]) < score(sorted[j]) })
+
+	addrs := make([]string, 0, len(sorted))
+	for _, a := range sorted {
 		addrs = append(addrs, fmt.Sprintf("%s/p2p/%s", a, n.peerID))
 	}
 	return addrs
+}
+
+// awaitRelayAddr waits up to timeout for a /p2p-circuit address -- proof
+// the Config.RelayPeer reservation configured in newHost has completed --
+// to appear in n.host.Addrs(). A no-op that returns immediately when
+// RelayPeer isn't set, since there's then nothing to wait for.
+func (n *Node) awaitRelayAddr(timeout time.Duration) {
+	if n.cfg.RelayPeer == "" {
+		return
+	}
+	deadline := time.After(timeout)
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		for _, a := range n.host.Addrs() {
+			if strings.Contains(a.String(), "/p2p-circuit") {
+				return
+			}
+		}
+		select {
+		case <-deadline:
+			return
+		case <-ticker.C:
+		}
+	}
 }
 
 // ReadyInfo is the content of ReadyFileName: what the spawning `mage
@@ -472,6 +598,14 @@ func (n *Node) join(ctx context.Context, leaderAddr string) error {
 	}
 	defer s.Close()
 
+	// If this node needs a relay reservation to be reachable at all (see
+	// Config.RelayPeer), give it a moment to complete before announcing an
+	// address: AutoRelay's reservation happens asynchronously in the
+	// background from newHost, and raft's configuration stores whatever
+	// address we send here permanently -- getting it before the /p2p-circuit
+	// address exists means the leader can never actually reach this node.
+	n.awaitRelayAddr(15 * time.Second)
+
 	selfAddr := n.advertisedAddrs()[0]
 	if _, err := fmt.Fprintf(s, "%s %s\n", n.peerID, selfAddr); err != nil {
 		return fmt.Errorf("send join request: %w", err)
@@ -495,46 +629,161 @@ func (n *Node) join(ctx context.Context, leaderAddr string) error {
 }
 
 // handleJoinStream is the leader-side handler for JoinProtocolID: it parses
-// "<peer-id> <multiaddr>" from the requester and adds it as a raft voter.
+// "<peer-id> <multiaddr>" from the requester and adds it as a raft voter if
+// this node is the leader, or forwards the request to whoever currently is
+// (one hop only, over ForwardJoinProtocolID -- see handleForwardJoinStream)
+// since the joining node has no other way to learn the real leader.
 func (n *Node) handleJoinStream(s network.Stream) {
 	defer s.Close()
 
-	scanner := bufio.NewScanner(s)
-	if !scanner.Scan() {
-		fmt.Fprintf(s, "ERR: empty join request\n")
+	joinPeerID, joinAddr, err := parseJoinRequest(s)
+	if err != nil {
+		fmt.Fprintf(s, "ERR: malformed join request: %v\n", err)
 		return
 	}
-	line := scanner.Text()
 
-	var joinPeerID, joinAddr string
-	if _, err := fmt.Sscanf(line, "%s %s", &joinPeerID, &joinAddr); err != nil {
+	rf := n.getRaft()
+	if rf != nil && rf.State() == raft.Leader {
+		fmt.Fprintf(s, "%s\n", addVoterLine(rf, joinPeerID, joinAddr))
+		return
+	}
+
+	var leaderID raft.ServerID
+	if rf != nil {
+		_, leaderID = rf.LeaderWithID()
+	}
+	if leaderID == "" {
+		fmt.Fprintf(s, "ERR: not leader\n")
+		return
+	}
+
+	line, err := n.forwardJoin(context.Background(), leaderID, joinPeerID, joinAddr)
+	if err != nil {
+		fmt.Fprintf(s, "ERR: forward join: %v\n", err)
+		return
+	}
+	fmt.Fprintf(s, "%s\n", line)
+}
+
+// handleForwardJoinStream is the leader-side handler for
+// ForwardJoinProtocolID: it adds the requester as a raft voter if this node
+// is actually the leader, or reports the current leader without forwarding
+// again -- mirroring handleForwardSetStream's single-hop guarantee, which
+// rules out a forwarding cycle regardless of how leadership bounces around.
+func (n *Node) handleForwardJoinStream(s network.Stream) {
+	defer s.Close()
+
+	joinPeerID, joinAddr, err := parseJoinRequest(s)
+	if err != nil {
 		fmt.Fprintf(s, "ERR: malformed join request: %v\n", err)
 		return
 	}
 
 	rf := n.getRaft()
 	if rf == nil || rf.State() != raft.Leader {
-		fmt.Fprintf(s, "ERR: not leader\n")
+		var leaderID raft.ServerID
+		if rf != nil {
+			_, leaderID = rf.LeaderWithID()
+		}
+		fmt.Fprintf(s, "ERR: not leader; current leader is %s (already forwarded once)\n", leaderID)
 		return
 	}
 
-	if err := rf.AddVoter(raft.ServerID(joinPeerID), raft.ServerAddress(joinAddr), 0, 10*time.Second).Error(); err != nil {
-		fmt.Fprintf(s, "ERR: %v\n", err)
-		return
-	}
-	fmt.Fprintf(s, "OK\n")
+	fmt.Fprintf(s, "%s\n", addVoterLine(rf, joinPeerID, joinAddr))
 }
 
-func (n *Node) handleSet(_ context.Context, req ipcproto.Request) ipcproto.Response {
-	// Both wait windows scale off the actual configured election timeout
-	// (not a fixed constant) so a WAN-tuned longer timeout still gets a
-	// comfortable margin: Apply itself can legitimately take a full
+// parseJoinRequest reads and parses the single "<peer-id> <multiaddr>" line
+// that is the wire format shared by JoinProtocolID and ForwardJoinProtocolID.
+func parseJoinRequest(s network.Stream) (peerID, addr string, err error) {
+	scanner := bufio.NewScanner(s)
+	if !scanner.Scan() {
+		if err := scanner.Err(); err != nil {
+			return "", "", err
+		}
+		return "", "", fmt.Errorf("empty join request")
+	}
+	if _, err := fmt.Sscanf(scanner.Text(), "%s %s", &peerID, &addr); err != nil {
+		return "", "", err
+	}
+	return peerID, addr, nil
+}
+
+// addVoterLine runs raft.AddVoter for joinPeerID/joinAddr and returns the
+// response line to send back over the wire: "OK" or "ERR: <reason>".
+func addVoterLine(rf *raft.Raft, joinPeerID, joinAddr string) string {
+	if err := rf.AddVoter(raft.ServerID(joinPeerID), raft.ServerAddress(joinAddr), 0, 10*time.Second).Error(); err != nil {
+		return fmt.Sprintf("ERR: %v", err)
+	}
+	return "OK"
+}
+
+// forwardJoin relays a join request (joinPeerID, joinAddr) to leaderID over
+// ForwardJoinProtocolID and returns its response line verbatim (without the
+// trailing newline). Mirrors forwardSet's reasoning: the libp2p host
+// already knows how to reach leaderID via this node's own raft transport,
+// so no address resolution beyond the peer id is needed.
+func (n *Node) forwardJoin(ctx context.Context, leaderID raft.ServerID, joinPeerID, joinAddr string) (string, error) {
+	pid, err := peer.Decode(string(leaderID))
+	if err != nil {
+		return "", fmt.Errorf("invalid leader id %s: %w", leaderID, err)
+	}
+	s, err := n.host.NewStream(ctx, pid, ForwardJoinProtocolID)
+	if err != nil {
+		return "", fmt.Errorf("open forward-join stream to leader %s: %w", leaderID, err)
+	}
+	defer s.Close()
+
+	if _, err := fmt.Fprintf(s, "%s %s\n", joinPeerID, joinAddr); err != nil {
+		return "", fmt.Errorf("write to leader %s: %w", leaderID, err)
+	}
+	if err := s.CloseWrite(); err != nil {
+		return "", fmt.Errorf("close write to leader %s: %w", leaderID, err)
+	}
+
+	scanner := bufio.NewScanner(s)
+	if !scanner.Scan() {
+		if err := scanner.Err(); err != nil {
+			return "", fmt.Errorf("read response from leader %s: %w", leaderID, err)
+		}
+		return "", fmt.Errorf("no response from leader %s", leaderID)
+	}
+	return scanner.Text(), nil
+}
+
+// handleSet is the IPC entry point for ActionSet: it applies directly if
+// this node is the leader, or forwards to the leader (one hop only) if
+// not. Handler is not exported to pkg/ipc directly; see handle's switch.
+func (n *Node) handleSet(ctx context.Context, req ipcproto.Request) ipcproto.Response {
+	return n.handleSetForward(ctx, req, true)
+}
+
+// handleSetForward implements handleSet, plus handleForwardSetStream's
+// leader-side answer to an already-forwarded request. allowForward is
+// false on that second path so a request can be forwarded at most once:
+// if the node it lands on then *also* turns out not to be leader (a
+// leadership change mid-flight), it fails outward with a clear error
+// instead of forwarding again, which rules out any forwarding cycle
+// regardless of how leadership bounces around.
+func (n *Node) handleSetForward(ctx context.Context, req ipcproto.Request, allowForward bool) ipcproto.Response {
+	// Both wait windows below scale off the actual configured election
+	// timeout (not a fixed constant) so a WAN-tuned longer timeout still
+	// gets a comfortable margin: Apply itself can legitimately take a full
 	// election cycle if the leader steps down and a new one is elected
 	// mid-call.
-	rf, err := n.awaitLeader(5 * n.electionTimeout)
+	rf, isLeader, leaderID, err := n.resolveWriteTarget(5 * n.electionTimeout)
 	if err != nil {
 		return ipcproto.NewResponse(ipcproto.StatusError, err.Error())
 	}
+	if isLeader {
+		return n.applySet(rf, req)
+	}
+	if !allowForward {
+		return ipcproto.NewResponse(ipcproto.StatusError, fmt.Sprintf("not leader; current leader is %s (already forwarded once)", leaderID))
+	}
+	return n.forwardSet(ctx, leaderID, req)
+}
+
+func (n *Node) applySet(rf *raft.Raft, req ipcproto.Request) ipcproto.Response {
 	cmd := kvfsm.EncodeCommand(kvfsm.OpSet, []byte(req.KeyString()), []byte(req.ValueString()))
 	future := rf.Apply(cmd, 10*n.electionTimeout)
 	if err := future.Error(); err != nil {
@@ -544,6 +793,62 @@ func (n *Node) handleSet(_ context.Context, req ipcproto.Request) ipcproto.Respo
 		return ipcproto.NewResponse(ipcproto.StatusError, res.Err.Error())
 	}
 	return ipcproto.NewResponse(ipcproto.StatusOK, "")
+}
+
+// forwardSet relays req (an ActionSet) to leaderID over ForwardProtocolID
+// and returns its response verbatim. The libp2p host already has an open
+// connection/known address for leaderID -- it's the peer this node's own
+// raft transport talks to for AppendEntries -- so no address resolution
+// is needed beyond the peer id itself.
+func (n *Node) forwardSet(ctx context.Context, leaderID raft.ServerID, req ipcproto.Request) ipcproto.Response {
+	pid, err := peer.Decode(string(leaderID))
+	if err != nil {
+		return ipcproto.NewResponse(ipcproto.StatusError, fmt.Sprintf("forward set: invalid leader id %s: %v", leaderID, err))
+	}
+	s, err := n.host.NewStream(ctx, pid, ForwardProtocolID)
+	if err != nil {
+		return ipcproto.NewResponse(ipcproto.StatusError, fmt.Sprintf("forward set to leader %s: %v", leaderID, err))
+	}
+	defer s.Close()
+
+	buf := req.Encode()
+	if _, err := s.Write(buf[:]); err != nil {
+		return ipcproto.NewResponse(ipcproto.StatusError, fmt.Sprintf("forward set: write to leader %s: %v", leaderID, err))
+	}
+	if err := s.CloseWrite(); err != nil {
+		return ipcproto.NewResponse(ipcproto.StatusError, fmt.Sprintf("forward set: close write to leader %s: %v", leaderID, err))
+	}
+
+	respBuf := make([]byte, ipcproto.ResponseSize)
+	if _, err := io.ReadFull(s, respBuf); err != nil {
+		return ipcproto.NewResponse(ipcproto.StatusError, fmt.Sprintf("forward set: read response from leader %s: %v", leaderID, err))
+	}
+	resp, err := ipcproto.DecodeResponse(respBuf)
+	if err != nil {
+		return ipcproto.NewResponse(ipcproto.StatusError, fmt.Sprintf("forward set: decode response: %v", err))
+	}
+	return resp
+}
+
+// handleForwardSetStream is the leader-side handler for ForwardProtocolID:
+// it decodes a full ipcproto.Request (always an ActionSet) and answers it
+// exactly like a local Set would, with forwarding disabled (see
+// handleSetForward's allowForward doc).
+func (n *Node) handleForwardSetStream(s network.Stream) {
+	defer s.Close()
+
+	buf := make([]byte, ipcproto.RequestSize)
+	if _, err := io.ReadFull(s, buf); err != nil {
+		return
+	}
+	req, err := ipcproto.DecodeRequest(buf)
+	if err != nil {
+		return
+	}
+
+	resp := n.handleSetForward(context.Background(), req, false)
+	respBuf := resp.Encode()
+	s.Write(respBuf[:])
 }
 
 func (n *Node) handleGet(_ context.Context, req ipcproto.Request) ipcproto.Response {
@@ -577,6 +882,35 @@ func (n *Node) awaitLeader(timeout time.Duration) (*raft.Raft, error) {
 				return nil, fmt.Errorf("not leader; current leader is %s", leaderID)
 			}
 			return nil, fmt.Errorf("not leader and no leader known")
+		case <-ticker.C:
+		}
+	}
+}
+
+// resolveWriteTarget waits (up to timeout) for this node to either become
+// raft leader itself or learn who currently is, and reports which. In
+// steady state this returns on its very first check, with no waiting at
+// all -- the timeout only matters right after bootstrap/join, before
+// raft's first election has completed and LeaderWithID is still empty.
+func (n *Node) resolveWriteTarget(timeout time.Duration) (rf *raft.Raft, isLeader bool, leaderID raft.ServerID, err error) {
+	deadline := time.After(timeout)
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if rf := n.getRaft(); rf != nil {
+			if rf.State() == raft.Leader {
+				return rf, true, "", nil
+			}
+			if _, id := rf.LeaderWithID(); id != "" {
+				return rf, false, id, nil
+			}
+		}
+		select {
+		case <-deadline:
+			if n.getRaft() == nil {
+				return nil, false, "", fmt.Errorf("node has not been added to a cluster yet")
+			}
+			return nil, false, "", fmt.Errorf("not leader and no leader known")
 		case <-ticker.C:
 		}
 	}

@@ -1,6 +1,17 @@
+//go:build !android
+
 // Package ipc implements local (same-machine) request/response IPC between
 // the short-lived mage CLI process and a long-running kvnode daemon, over
 // github.com/gofsd/shmring shared-memory ring buffers.
+//
+// This file is the desktop (linux/darwin/windows) transport, built on
+// shmring's name-based CreateShm/OpenShm. GOOS=android inherits Go's
+// "linux" build tag (a long-standing special case in the toolchain's
+// build-constraint matching), so it needs excluding explicitly here, same
+// as shmring's own backend does for the same reason -- see ipc_android.go
+// for the real Android transport and why it has to be a different design
+// entirely (ASharedMemory, which is what Android actually provides, has no
+// name-based rendezvous at all).
 //
 // # Design
 //
