@@ -105,15 +105,17 @@ over `pkg/daemon.ForwardProtocolID`.
 "Unknown sources" allowed — there's a separate Developer Options toggle, **"Install via USB"**,
 that must also be enabled.
 
-**Known caveat — relay reservations for NAT'd followers**: `pkg/daemon.Config.RelayPeer` (and the
-mirroring `mobile/kvmobile.relayMultiaddr` build-time var) exist so a follower with no
-directly-dialable address (e.g. a phone behind carrier-grade NAT) can proactively reserve a
-circuit-relay v2 slot through the leader. As currently wired, setting it causes the join
-handshake to fail with a libp2p stream-protocol-negotiation error (`0x1001`), likely from
-resource contention between the relay reservation and the join stream to the same peer — it needs
-further investigation before it's usable. Leave `relayMultiaddr` unset (the default) for now; a
-plain direct join has been tested working from a phone on cellular data, joining a publicly
-reachable leader.
+**Relay reservations for NAT'd followers**: `pkg/daemon.Config.RelayPeer` (and the mirroring
+`mobile/kvmobile.relayMultiaddr` build-time var) let a follower with no directly-dialable address
+(e.g. a phone behind carrier-grade NAT) proactively reserve a circuit-relay v2 slot through the
+leader, so a raft voter that nothing can dial directly can still be reached. This previously
+failed the join handshake with a libp2p stream-protocol-negotiation error (`0x1001`): the relay
+reservation wait was sitting between opening the join stream and writing to it, easily outlasting
+the remote's negotiation timeout. It's fixed — `join()` now waits for the reservation before
+opening the stream at all, and the node also forces itself privately reachable when `RelayPeer` is
+set rather than leaving that judgment to AutoNAT — and covered by a real relay+leader+follower
+cluster test (`pkg/daemon.TestJoinThroughRelay`). A plain direct join (no `relayMultiaddr`) has
+also been tested working from a phone on cellular data, joining a publicly reachable leader.
 
 ## Vendored dependency patch
 
