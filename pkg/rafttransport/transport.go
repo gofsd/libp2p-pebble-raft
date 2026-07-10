@@ -24,7 +24,7 @@ import (
 )
 
 // ProtocolID is the libp2p protocol used for raft RPC streams.
-const ProtocolID = protocol.ID("/libp2p-pebble-raft/raft/1.0.0")
+const ProtocolID = protocol.ID("/libp2p-kv-raft/raft/1.0.0")
 
 // streamLayer implements raft.StreamLayer over a libp2p host.
 type streamLayer struct {

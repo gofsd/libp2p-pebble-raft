@@ -24,9 +24,9 @@ import (
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/peer"
 
-	"github.com/gofsd/libp2p-pebble-raft/pkg/daemon"
-	"github.com/gofsd/libp2p-pebble-raft/pkg/ipc"
-	"github.com/gofsd/libp2p-pebble-raft/pkg/ipcproto"
+	"github.com/gofsd/libp2p-kv-raft/pkg/daemon"
+	"github.com/gofsd/libp2p-kv-raft/pkg/ipc"
+	"github.com/gofsd/libp2p-kv-raft/pkg/ipcproto"
 )
 
 // leaderMultiaddr is baked in at build time -- see package doc comment.

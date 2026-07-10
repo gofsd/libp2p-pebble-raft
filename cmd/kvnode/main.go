@@ -11,7 +11,7 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/gofsd/libp2p-pebble-raft/pkg/daemon"
+	"github.com/gofsd/libp2p-kv-raft/pkg/daemon"
 )
 
 func main() {

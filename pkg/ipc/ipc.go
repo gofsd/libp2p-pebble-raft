@@ -102,7 +102,7 @@ import (
 
 	"github.com/gofsd/shmring"
 
-	"github.com/gofsd/libp2p-pebble-raft/pkg/ipcproto"
+	"github.com/gofsd/libp2p-kv-raft/pkg/ipcproto"
 )
 
 // capacity is the shared-memory data region size for both channels. It must

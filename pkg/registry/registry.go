@@ -58,7 +58,7 @@ type Registry struct {
 // isolate their state from the operator's real registry.
 const EnvHome = "KVSTORE_HOME"
 
-// Open resolves the registry root (EnvHome, or ~/.libp2p-pebble-raft),
+// Open resolves the registry root (EnvHome, or ~/.libp2p-kv-raft),
 // creates it if necessary, and returns a handle to it.
 func Open() (*Registry, error) {
 	dir := os.Getenv(EnvHome)
@@ -67,7 +67,7 @@ func Open() (*Registry, error) {
 		if err != nil {
 			return nil, fmt.Errorf("registry: resolve home dir: %w", err)
 		}
-		dir = filepath.Join(home, ".libp2p-pebble-raft")
+		dir = filepath.Join(home, ".libp2p-kv-raft")
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("registry: create %s: %w", dir, err)

@@ -26,7 +26,7 @@ import (
 	"github.com/multiformats/go-multiaddr"
 )
 
-const ProtocolID = "/libp2p-pebble-raft/1.0.0"
+const ProtocolID = "/libp2p-kv-raft/1.0.0"
 
 // P2PNode represents a libp2p node that works behind strict NATs
 type P2PNode struct {

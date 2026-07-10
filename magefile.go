@@ -15,7 +15,7 @@ import (
 	"github.com/magefile/mage/mg"
 	"github.com/magefile/mage/sh"
 
-	"github.com/gofsd/libp2p-pebble-raft/pkg/kvctl"
+	"github.com/gofsd/libp2p-kv-raft/pkg/kvctl"
 )
 
 // Default target to run if none is specified

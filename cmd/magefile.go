@@ -13,7 +13,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/gofsd/libp2p-pebble-raft/pkg/raft"
+	"github.com/gofsd/libp2p-kv-raft/pkg/raft"
 )
 
 // Relay starts the libp2p Relay and Signaling server

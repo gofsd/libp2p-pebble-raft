@@ -36,17 +36,17 @@ import (
 	"github.com/multiformats/go-multiaddr"
 	manet "github.com/multiformats/go-multiaddr/net"
 
-	"github.com/gofsd/libp2p-pebble-raft/pkg/ipc"
-	"github.com/gofsd/libp2p-pebble-raft/pkg/ipcproto"
-	"github.com/gofsd/libp2p-pebble-raft/pkg/kvfsm"
-	"github.com/gofsd/libp2p-pebble-raft/pkg/rafttransport"
-	"github.com/gofsd/libp2p-pebble-raft/pkg/registry"
-	"github.com/gofsd/libp2p-pebble-raft/pkg/store"
+	"github.com/gofsd/libp2p-kv-raft/pkg/ipc"
+	"github.com/gofsd/libp2p-kv-raft/pkg/ipcproto"
+	"github.com/gofsd/libp2p-kv-raft/pkg/kvfsm"
+	"github.com/gofsd/libp2p-kv-raft/pkg/rafttransport"
+	"github.com/gofsd/libp2p-kv-raft/pkg/registry"
+	"github.com/gofsd/libp2p-kv-raft/pkg/store"
 )
 
 // JoinProtocolID is the libp2p protocol a joining node uses to ask an
 // existing leader to add it as a voter.
-const JoinProtocolID = protocol.ID("/libp2p-pebble-raft/join/1.0.0")
+const JoinProtocolID = protocol.ID("/libp2p-kv-raft/join/1.0.0")
 
 // ForwardProtocolID is the libp2p protocol a non-leader node uses to relay
 // a Set to the current raft leader on the caller's behalf. Needed because
@@ -56,7 +56,7 @@ const JoinProtocolID = protocol.ID("/libp2p-pebble-raft/join/1.0.0")
 // the application. In particular, the Android build of this project runs
 // as a follower with no separate "find the leader" step available to its
 // UI, so every Set it issues needs this to reach the leader at all.
-const ForwardProtocolID = protocol.ID("/libp2p-pebble-raft/forward-set/1.0.0")
+const ForwardProtocolID = protocol.ID("/libp2p-kv-raft/forward-set/1.0.0")
 
 // ForwardJoinProtocolID is the libp2p protocol a non-leader node uses to
 // relay a Join request to the current raft leader on the joining node's
@@ -66,7 +66,7 @@ const ForwardProtocolID = protocol.ID("/libp2p-pebble-raft/forward-set/1.0.0")
 // new node was told to join through (e.g. a leader address baked into an
 // Android build at compile time) may no longer be the leader by the time
 // it actually tries.
-const ForwardJoinProtocolID = protocol.ID("/libp2p-pebble-raft/forward-join/1.0.0")
+const ForwardJoinProtocolID = protocol.ID("/libp2p-kv-raft/forward-join/1.0.0")
 
 // ReadyFileName is written to Config.DataDir once the daemon's host and IPC
 // server are up, so the spawning `mage addnode` can learn the node's peer id

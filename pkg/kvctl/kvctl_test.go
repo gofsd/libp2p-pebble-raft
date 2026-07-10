@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gofsd/libp2p-pebble-raft/pkg/kvctl"
-	"github.com/gofsd/libp2p-pebble-raft/pkg/registry"
+	"github.com/gofsd/libp2p-kv-raft/pkg/kvctl"
+	"github.com/gofsd/libp2p-kv-raft/pkg/registry"
 )
 
 // repoRoot walks up from this test file's location to the module root

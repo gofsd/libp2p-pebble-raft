@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gofsd/libp2p-pebble-raft/pkg/raft"
+	"github.com/gofsd/libp2p-kv-raft/pkg/raft"
 )
 
 // TestP2PViaRelay is the canonical integration test for end-to-end P2P

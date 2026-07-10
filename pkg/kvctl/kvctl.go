@@ -14,10 +14,10 @@ import (
 	"runtime"
 	"time"
 
-	"github.com/gofsd/libp2p-pebble-raft/pkg/daemon"
-	"github.com/gofsd/libp2p-pebble-raft/pkg/ipc"
-	"github.com/gofsd/libp2p-pebble-raft/pkg/ipcproto"
-	"github.com/gofsd/libp2p-pebble-raft/pkg/registry"
+	"github.com/gofsd/libp2p-kv-raft/pkg/daemon"
+	"github.com/gofsd/libp2p-kv-raft/pkg/ipc"
+	"github.com/gofsd/libp2p-kv-raft/pkg/ipcproto"
+	"github.com/gofsd/libp2p-kv-raft/pkg/registry"
 )
 
 // readyTimeout bounds how long AddNode waits for a freshly spawned daemon to

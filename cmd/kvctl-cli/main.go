@@ -15,7 +15,7 @@ import (
 	"os"
 	"strconv"
 
-	"github.com/gofsd/libp2p-pebble-raft/pkg/kvctl"
+	"github.com/gofsd/libp2p-kv-raft/pkg/kvctl"
 )
 
 func main() {

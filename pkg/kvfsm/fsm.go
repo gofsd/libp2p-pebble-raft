@@ -9,7 +9,7 @@ import (
 
 	"github.com/hashicorp/raft"
 
-	"github.com/gofsd/libp2p-pebble-raft/pkg/store"
+	"github.com/gofsd/libp2p-kv-raft/pkg/store"
 )
 
 // OpType identifies the kind of mutation carried by a raft log entry.

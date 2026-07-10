@@ -1,4 +1,4 @@
-module github.com/gofsd/libp2p-pebble-raft
+module github.com/gofsd/libp2p-kv-raft
 
 go 1.25.9
 

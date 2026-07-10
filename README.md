@@ -1,4 +1,4 @@
-# libp2p-pebble-raft
+# libp2p-kv-raft
 
 A distributed key-value store: [hashicorp/raft](https://github.com/hashicorp/raft) consensus
 running over [libp2p](https://github.com/libp2p/go-libp2p) transport, with
@@ -47,7 +47,7 @@ ssh user@remote 'KVSTORE_HOME=/opt/kvstore /opt/kvstore/bin/kvctl-cli addnode \
 directly-dialable address of their own, e.g. a phone on cellular) and forces it to advertise
 itself as publicly reachable. `-listen-port` pins the port so it survives restarts.
 `KVSTORE_HOME` controls where the registry/node data lives (defaults to
-`~/.libp2p-pebble-raft`); set it explicitly and pass it on every subsequent `kvctl-cli` call
+`~/.libp2p-kv-raft`); set it explicitly and pass it on every subsequent `kvctl-cli` call
 against that install.
 
 Print the leader's multiaddr for followers to join against:
@@ -82,7 +82,7 @@ export ANDROID_NDK_HOME=<path-to-ndk>   # e.g. $ANDROID_HOME/ndk/<version>
 LEADER_ADDR="/ip4/<remote-ip>/tcp/4001/p2p/<leader-peer-id>"
 
 gomobile bind -target=android -androidapi 26 \
-  -ldflags "-X github.com/gofsd/libp2p-pebble-raft/mobile/kvmobile.leaderMultiaddr=$LEADER_ADDR" \
+  -ldflags "-X github.com/gofsd/libp2p-kv-raft/mobile/kvmobile.leaderMultiaddr=$LEADER_ADDR" \
   -o android-app/app/libs/kvmobile.aar ./mobile/kvmobile
 
 cd android-app && gradle assembleDebug   # no wrapper checked in; use a local gradle install
