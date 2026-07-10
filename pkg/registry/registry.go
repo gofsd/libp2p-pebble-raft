@@ -79,7 +79,7 @@ func (r *Registry) jsonPath() string    { return filepath.Join(r.Dir, "registry.
 func (r *Registry) currentPath() string { return filepath.Join(r.Dir, "current") }
 
 // NodeDataDir returns the directory a node identified by peerID should store
-// its identity key, pebble data, and raft log under. Callers use this before
+// its identity key, sqlite data, and raft log under. Callers use this before
 // a NodeInfo even exists in the registry, when provisioning a brand new (or
 // resuming an existing) node.
 func (r *Registry) NodeDataDir(peerID string) string {

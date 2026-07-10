@@ -2,7 +2,8 @@
 
 A distributed key-value store: [hashicorp/raft](https://github.com/hashicorp/raft) consensus
 running over [libp2p](https://github.com/libp2p/go-libp2p) transport, with
-[Pebble](https://github.com/cockroachdb/pebble) as the on-disk store for the replicated state
+[SQLite](https://sqlite.org/) (via the pure-Go [modernc.org/sqlite](https://pkg.go.dev/modernc.org/sqlite)
+driver, so no CGO toolchain is needed) as the on-disk store for the replicated state
 machine. Nodes can run on separate machines (including behind NAT/cellular, e.g. an Android
 phone) and are driven locally over `github.com/gofsd/shmring` shared-memory IPC rather than a
 network-facing RPC port.

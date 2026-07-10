@@ -201,7 +201,7 @@ func resumeNode(reg *registry.Registry, binPath string, extraDaemonArgs []string
 
 // ensureNotAlreadyRunning refuses to spawn a second daemon against the same
 // data dir if the registry's last known PID for it is still alive -- two
-// processes writing to the same Pebble/BoltDB files concurrently would
+// processes writing to the same SQLite/BoltDB files concurrently would
 // corrupt them.
 func ensureNotAlreadyRunning(info registry.NodeInfo) error {
 	if info.PID != 0 && isAlive(info.PID) {

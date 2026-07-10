@@ -1,26 +1,46 @@
-// Package store wraps a cockroachdb/pebble database as the on-disk key/value
-// backend for a single raft node's FSM.
+// Package store wraps a SQLite database (via the pure-Go modernc.org/sqlite
+// driver, so cross-compiling this project -- notably to Android -- needs no
+// CGO toolchain) as the on-disk key/value backend for a single raft node's
+// FSM.
 package store
 
 import (
+	"database/sql"
 	"errors"
 	"io"
+	"os"
+	"path/filepath"
 
-	"github.com/cockroachdb/pebble"
+	_ "modernc.org/sqlite"
 )
 
 // ErrNotFound is returned by Get when the key does not exist.
 var ErrNotFound = errors.New("store: key not found")
 
-// Store is a durable key/value store backed by Pebble.
+// Store is a durable key/value store backed by SQLite.
 type Store struct {
-	db *pebble.DB
+	db *sql.DB
 }
 
-// Open opens (creating if necessary) a Pebble database rooted at dir.
+// Open opens (creating if necessary) a SQLite database rooted at dir.
 func Open(dir string) (*Store, error) {
-	db, err := pebble.Open(dir, &pebble.Options{})
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, err
+	}
+	dsn := filepath.Join(dir, "kv.db") + "?_pragma=journal_mode(WAL)&_pragma=synchronous(FULL)"
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
+		return nil, err
+	}
+	// SQLite allows only one writer at a time regardless of connection count,
+	// and raft already serializes every mutation through FSM.Apply -- so a
+	// single shared connection just avoids SQLITE_BUSY lock-contention
+	// errors between that writer and concurrent Get reads (e.g. from an IPC
+	// handler goroutine) instead of buying any real parallelism.
+	db.SetMaxOpenConns(1)
+
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS kv (key BLOB PRIMARY KEY, value BLOB NOT NULL)`); err != nil {
+		db.Close()
 		return nil, err
 	}
 	return &Store{db: db}, nil
@@ -28,26 +48,27 @@ func Open(dir string) (*Store, error) {
 
 // Get returns the value for key, or ErrNotFound if it does not exist.
 func (s *Store) Get(key []byte) ([]byte, error) {
-	v, closer, err := s.db.Get(key)
+	var v []byte
+	err := s.db.QueryRow(`SELECT value FROM kv WHERE key = ?`, key).Scan(&v)
 	if err != nil {
-		if errors.Is(err, pebble.ErrNotFound) {
+		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
 		}
 		return nil, err
 	}
-	out := make([]byte, len(v))
-	copy(out, v)
-	return out, closer.Close()
+	return v, nil
 }
 
 // Set writes key/value durably.
 func (s *Store) Set(key, value []byte) error {
-	return s.db.Set(key, value, pebble.Sync)
+	_, err := s.db.Exec(`INSERT INTO kv(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`, key, value)
+	return err
 }
 
 // Delete removes key.
 func (s *Store) Delete(key []byte) error {
-	return s.db.Delete(key, pebble.Sync)
+	_, err := s.db.Exec(`DELETE FROM kv WHERE key = ?`, key)
+	return err
 }
 
 // Close closes the underlying database.
@@ -59,17 +80,16 @@ func (s *Store) Close() error {
 // as [4-byte big-endian key length][key][4-byte big-endian value length]
 // [value], repeated. It is used by the raft FSM snapshot.
 func (s *Store) DumpAll(w io.Writer) error {
-	iter, err := s.db.NewIter(nil)
+	rows, err := s.db.Query(`SELECT key, value FROM kv`)
 	if err != nil {
 		return err
 	}
-	defer iter.Close()
+	defer rows.Close()
 
 	var lenBuf [4]byte
-	for valid := iter.First(); valid; valid = iter.Next() {
-		k := iter.Key()
-		v, err := iter.ValueAndErr()
-		if err != nil {
+	for rows.Next() {
+		var k, v []byte
+		if err := rows.Scan(&k, &v); err != nil {
 			return err
 		}
 		putUint32(lenBuf[:], uint32(len(k)))
@@ -87,18 +107,27 @@ func (s *Store) DumpAll(w io.Writer) error {
 			return err
 		}
 	}
-	return iter.Error()
+	return rows.Err()
 }
 
 // LoadAll replaces the store's contents with the key/value pairs read from
 // r, in the format produced by DumpAll. It is used by the raft FSM restore.
 func (s *Store) LoadAll(r io.Reader) error {
-	if err := s.deleteAll(); err != nil {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec(`DELETE FROM kv`); err != nil {
 		return err
 	}
 
-	batch := s.db.NewBatch()
-	defer batch.Close()
+	stmt, err := tx.Prepare(`INSERT INTO kv(key, value) VALUES(?, ?)`)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
 
 	var lenBuf [4]byte
 	for {
@@ -119,31 +148,11 @@ func (s *Store) LoadAll(r io.Reader) error {
 		if _, err := io.ReadFull(r, value); err != nil {
 			return err
 		}
-		if err := batch.Set(key, value, nil); err != nil {
+		if _, err := stmt.Exec(key, value); err != nil {
 			return err
 		}
 	}
-	return batch.Commit(pebble.Sync)
-}
-
-func (s *Store) deleteAll() error {
-	iter, err := s.db.NewIter(nil)
-	if err != nil {
-		return err
-	}
-	defer iter.Close()
-
-	batch := s.db.NewBatch()
-	defer batch.Close()
-	for valid := iter.First(); valid; valid = iter.Next() {
-		if err := batch.Delete(iter.Key(), nil); err != nil {
-			return err
-		}
-	}
-	if err := iter.Error(); err != nil {
-		return err
-	}
-	return batch.Commit(pebble.Sync)
+	return tx.Commit()
 }
 
 func putUint32(b []byte, v uint32) {

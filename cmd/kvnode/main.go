@@ -15,7 +15,7 @@ import (
 )
 
 func main() {
-	dataDir := flag.String("data-dir", "", "node data directory (identity key, pebble, raft)")
+	dataDir := flag.String("data-dir", "", "node data directory (identity key, sqlite, raft)")
 	keyPath := flag.String("key-path", "", "path to this node's libp2p identity key")
 	listenPort := flag.Int("listen-port", 0, "TCP/QUIC port to listen on (0 = ephemeral; pin this for publicly reachable deployments)")
 	relayService := flag.Bool("relay-service", false, "act as a circuit-relay v2 point for other nodes and force public reachability (only for nodes with a real public address)")
