@@ -68,6 +68,23 @@ const ForwardProtocolID = protocol.ID("/libp2p-kv-raft/forward-set/1.0.0")
 // it actually tries.
 const ForwardJoinProtocolID = protocol.ID("/libp2p-kv-raft/forward-join/1.0.0")
 
+// ClientProtocolID is the libp2p protocol a remote client with no local
+// pkg/ipc channel of its own speaks directly to any cluster node to issue
+// Add/Set/Get requests -- namely the browser build in web-app/ (rust-libp2p
+// compiled to wasm), which has no shared process with this daemon the way
+// the Android build's in-process kvmobile does, and dials in over the
+// WebTransport listener newHost adds for exactly this. ActionAdd here means
+// something different than it does over pkg/ipc: a browser tab can never
+// accept a raw inbound connection, so it can never be a raft *voter* (a
+// voter's transport must be independently dialable by any other voter at
+// any time -- see rafttransport's doc comment), but it *can* be dialed
+// through a circuit-relay v2 reservation it already holds (the same
+// mechanism an Android device behind carrier-grade NAT already relies on --
+// see Config.RelayPeer), which makes it a real raft *non-voter* (learner):
+// Key carries the browser's own peer id, Value its reserved
+// /p2p-circuit multiaddr -- see handleAddLearner.
+const ClientProtocolID = protocol.ID("/libp2p-kv-raft/client/1.0.0")
+
 // ReadyFileName is written to Config.DataDir once the daemon's host and IPC
 // server are up, so the spawning `mage addnode` can learn the node's peer id
 // and listen addresses without parsing stdout.
@@ -255,6 +272,7 @@ func start(cfg Config) (*Node, error) {
 	h.SetStreamHandler(JoinProtocolID, n.handleJoinStream)
 	h.SetStreamHandler(ForwardProtocolID, n.handleForwardSetStream)
 	h.SetStreamHandler(ForwardJoinProtocolID, n.handleForwardJoinStream)
+	h.SetStreamHandler(ClientProtocolID, n.handleClientStream)
 	return n, nil
 }
 
@@ -272,6 +290,20 @@ func newHost(priv crypto.PrivKey, cfg Config) (lp2phost.Host, error) {
 		libp2p.ListenAddrStrings(
 			fmt.Sprintf("/ip4/0.0.0.0/tcp/%d", cfg.ListenPort),
 			fmt.Sprintf("/ip4/0.0.0.0/udp/%d/quic-v1", cfg.ListenPort),
+			// Shares the quic-v1 UDP port above (WebTransport is a session
+			// layered on the same QUIC socket, not a separate listener).
+			// The webtransport transport module itself is already part of
+			// go-libp2p's default transport set (this Config never calls
+			// libp2p.Transport, so DefaultTransports applies); only the
+			// listen address was missing, which is why every other node
+			// this project has run so far -- none of them reachable from a
+			// browser -- never noticed. n.host.Addrs() will report the
+			// resulting address with its /certhash component appended
+			// automatically, so advertisedAddrs()/ready.json need no
+			// change to start including it. See web-app/ for the browser
+			// client (js-libp2p, since go-libp2p itself has no usable
+			// browser-sandbox transport) that dials this.
+			fmt.Sprintf("/ip4/0.0.0.0/udp/%d/quic-v1/webtransport", cfg.ListenPort),
 		),
 		libp2p.EnableRelay(),
 		libp2p.EnableHolePunching(),
@@ -634,7 +666,7 @@ func (n *Node) join(ctx context.Context, leaderAddr string) error {
 	defer s.Close()
 
 	selfAddr := n.advertisedAddrs()[0]
-	if _, err := fmt.Fprintf(s, "%s %s\n", n.peerID, selfAddr); err != nil {
+	if _, err := fmt.Fprintf(s, "%s %s voter\n", n.peerID, selfAddr); err != nil {
 		return fmt.Errorf("send join request: %w", err)
 	}
 	if err := s.CloseWrite(); err != nil {
@@ -656,14 +688,15 @@ func (n *Node) join(ctx context.Context, leaderAddr string) error {
 }
 
 // handleJoinStream is the leader-side handler for JoinProtocolID: it parses
-// "<peer-id> <multiaddr>" from the requester and adds it as a raft voter if
-// this node is the leader, or forwards the request to whoever currently is
-// (one hop only, over ForwardJoinProtocolID -- see handleForwardJoinStream)
-// since the joining node has no other way to learn the real leader.
+// "<peer-id> <multiaddr> <voter|learner>" from the requester and adds it to
+// the raft configuration with the requested suffrage if this node is the
+// leader, or forwards the request to whoever currently is (one hop only,
+// over ForwardJoinProtocolID -- see handleForwardJoinStream) since the
+// joining node has no other way to learn the real leader.
 func (n *Node) handleJoinStream(s network.Stream) {
 	defer s.Close()
 
-	joinPeerID, joinAddr, err := parseJoinRequest(s)
+	joinPeerID, joinAddr, suffrage, err := parseJoinRequest(s)
 	if err != nil {
 		fmt.Fprintf(s, "ERR: malformed join request: %v\n", err)
 		return
@@ -671,7 +704,7 @@ func (n *Node) handleJoinStream(s network.Stream) {
 
 	rf := n.getRaft()
 	if rf != nil && rf.State() == raft.Leader {
-		fmt.Fprintf(s, "%s\n", addVoterLine(rf, joinPeerID, joinAddr))
+		fmt.Fprintf(s, "%s\n", addServerLine(rf, joinPeerID, joinAddr, suffrage))
 		return
 	}
 
@@ -684,7 +717,7 @@ func (n *Node) handleJoinStream(s network.Stream) {
 		return
 	}
 
-	line, err := n.forwardJoin(context.Background(), leaderID, joinPeerID, joinAddr)
+	line, err := n.forwardJoin(context.Background(), leaderID, joinPeerID, joinAddr, suffrage)
 	if err != nil {
 		fmt.Fprintf(s, "ERR: forward join: %v\n", err)
 		return
@@ -693,14 +726,15 @@ func (n *Node) handleJoinStream(s network.Stream) {
 }
 
 // handleForwardJoinStream is the leader-side handler for
-// ForwardJoinProtocolID: it adds the requester as a raft voter if this node
-// is actually the leader, or reports the current leader without forwarding
-// again -- mirroring handleForwardSetStream's single-hop guarantee, which
-// rules out a forwarding cycle regardless of how leadership bounces around.
+// ForwardJoinProtocolID: it adds the requester to the raft configuration
+// with the requested suffrage if this node is actually the leader, or
+// reports the current leader without forwarding again -- mirroring
+// handleForwardSetStream's single-hop guarantee, which rules out a
+// forwarding cycle regardless of how leadership bounces around.
 func (n *Node) handleForwardJoinStream(s network.Stream) {
 	defer s.Close()
 
-	joinPeerID, joinAddr, err := parseJoinRequest(s)
+	joinPeerID, joinAddr, suffrage, err := parseJoinRequest(s)
 	if err != nil {
 		fmt.Fprintf(s, "ERR: malformed join request: %v\n", err)
 		return
@@ -716,40 +750,68 @@ func (n *Node) handleForwardJoinStream(s network.Stream) {
 		return
 	}
 
-	fmt.Fprintf(s, "%s\n", addVoterLine(rf, joinPeerID, joinAddr))
+	fmt.Fprintf(s, "%s\n", addServerLine(rf, joinPeerID, joinAddr, suffrage))
 }
 
-// parseJoinRequest reads and parses the single "<peer-id> <multiaddr>" line
-// that is the wire format shared by JoinProtocolID and ForwardJoinProtocolID.
-func parseJoinRequest(s network.Stream) (peerID, addr string, err error) {
+// parseJoinRequest reads and parses the single
+// "<peer-id> <multiaddr> <voter|learner>" line that is the wire format
+// shared by JoinProtocolID and ForwardJoinProtocolID. The suffrage token
+// defaults to "voter" if absent, so a line written by an older build of
+// this same code (before ClientProtocolID's browser-learner join existed)
+// still parses the same way it always has.
+func parseJoinRequest(s network.Stream) (peerID, addr string, suffrage raft.ServerSuffrage, err error) {
 	scanner := bufio.NewScanner(s)
 	if !scanner.Scan() {
 		if err := scanner.Err(); err != nil {
-			return "", "", err
+			return "", "", raft.Voter, err
 		}
-		return "", "", fmt.Errorf("empty join request")
+		return "", "", raft.Voter, fmt.Errorf("empty join request")
 	}
-	if _, err := fmt.Sscanf(scanner.Text(), "%s %s", &peerID, &addr); err != nil {
-		return "", "", err
+	var suffrageWord string
+	fields := strings.Fields(scanner.Text())
+	switch len(fields) {
+	case 2:
+		peerID, addr = fields[0], fields[1]
+		suffrageWord = "voter"
+	case 3:
+		peerID, addr, suffrageWord = fields[0], fields[1], fields[2]
+	default:
+		return "", "", raft.Voter, fmt.Errorf("expected \"<peer-id> <multiaddr> [voter|learner]\", got %q", scanner.Text())
 	}
-	return peerID, addr, nil
+	switch suffrageWord {
+	case "voter":
+		suffrage = raft.Voter
+	case "learner":
+		suffrage = raft.Nonvoter
+	default:
+		return "", "", raft.Voter, fmt.Errorf("unknown suffrage %q", suffrageWord)
+	}
+	return peerID, addr, suffrage, nil
 }
 
-// addVoterLine runs raft.AddVoter for joinPeerID/joinAddr and returns the
-// response line to send back over the wire: "OK" or "ERR: <reason>".
-func addVoterLine(rf *raft.Raft, joinPeerID, joinAddr string) string {
-	if err := rf.AddVoter(raft.ServerID(joinPeerID), raft.ServerAddress(joinAddr), 0, 10*time.Second).Error(); err != nil {
+// addServerLine runs raft.AddVoter or raft.AddNonvoter (per suffrage) for
+// joinPeerID/joinAddr and returns the response line to send back over the
+// wire: "OK" or "ERR: <reason>".
+func addServerLine(rf *raft.Raft, joinPeerID, joinAddr string, suffrage raft.ServerSuffrage) string {
+	var future raft.IndexFuture
+	switch suffrage {
+	case raft.Nonvoter:
+		future = rf.AddNonvoter(raft.ServerID(joinPeerID), raft.ServerAddress(joinAddr), 0, 10*time.Second)
+	default:
+		future = rf.AddVoter(raft.ServerID(joinPeerID), raft.ServerAddress(joinAddr), 0, 10*time.Second)
+	}
+	if err := future.Error(); err != nil {
 		return fmt.Sprintf("ERR: %v", err)
 	}
 	return "OK"
 }
 
-// forwardJoin relays a join request (joinPeerID, joinAddr) to leaderID over
-// ForwardJoinProtocolID and returns its response line verbatim (without the
-// trailing newline). Mirrors forwardSet's reasoning: the libp2p host
-// already knows how to reach leaderID via this node's own raft transport,
-// so no address resolution beyond the peer id is needed.
-func (n *Node) forwardJoin(ctx context.Context, leaderID raft.ServerID, joinPeerID, joinAddr string) (string, error) {
+// forwardJoin relays a join request (joinPeerID, joinAddr, suffrage) to
+// leaderID over ForwardJoinProtocolID and returns its response line
+// verbatim (without the trailing newline). Mirrors forwardSet's reasoning:
+// the libp2p host already knows how to reach leaderID via this node's own
+// raft transport, so no address resolution beyond the peer id is needed.
+func (n *Node) forwardJoin(ctx context.Context, leaderID raft.ServerID, joinPeerID, joinAddr string, suffrage raft.ServerSuffrage) (string, error) {
 	pid, err := peer.Decode(string(leaderID))
 	if err != nil {
 		return "", fmt.Errorf("invalid leader id %s: %w", leaderID, err)
@@ -760,7 +822,11 @@ func (n *Node) forwardJoin(ctx context.Context, leaderID raft.ServerID, joinPeer
 	}
 	defer s.Close()
 
-	if _, err := fmt.Fprintf(s, "%s %s\n", joinPeerID, joinAddr); err != nil {
+	suffrageWord := "voter"
+	if suffrage == raft.Nonvoter {
+		suffrageWord = "learner"
+	}
+	if _, err := fmt.Fprintf(s, "%s %s %s\n", joinPeerID, joinAddr, suffrageWord); err != nil {
 		return "", fmt.Errorf("write to leader %s: %w", leaderID, err)
 	}
 	if err := s.CloseWrite(); err != nil {
@@ -876,6 +942,86 @@ func (n *Node) handleForwardSetStream(s network.Stream) {
 	resp := n.handleSetForward(context.Background(), req, false)
 	respBuf := resp.Encode()
 	s.Write(respBuf[:])
+}
+
+// handleClientStream is the leader-or-follower-side handler for
+// ClientProtocolID: it decodes a single ipcproto.Request and answers it the
+// same way this node's own pkg/ipc.Serve loop would for ActionSet (which
+// still forwards on to the real leader if this node isn't it -- a browser
+// client has no cheaper way to find the leader than any other caller does),
+// ActionGet (this node's own possibly-lagging local read, same caveat
+// pkg/ipc's Get answer already carries for any non-leader caller), or
+// ActionAdd (adds the browser as a raft non-voter -- see handleAddLearner
+// and ClientProtocolID's doc comment for why that's ActionAdd's meaning
+// here specifically, unlike everywhere else it means AddVoter).
+func (n *Node) handleClientStream(s network.Stream) {
+	defer s.Close()
+
+	buf := make([]byte, ipcproto.RequestSize)
+	if _, err := io.ReadFull(s, buf); err != nil {
+		return
+	}
+	req, err := ipcproto.DecodeRequest(buf)
+	if err != nil {
+		return
+	}
+
+	var resp ipcproto.Response
+	switch req.Action {
+	case ipcproto.ActionAdd:
+		resp = n.handleAddLearner(context.Background(), req)
+	case ipcproto.ActionSet:
+		resp = n.handleSet(context.Background(), req)
+	case ipcproto.ActionGet:
+		resp = n.handleGet(context.Background(), req)
+	default:
+		resp = ipcproto.NewResponse(ipcproto.StatusError, fmt.Sprintf("action %s not supported over the client protocol", req.Action))
+	}
+	resp.ID = req.ID
+
+	respBuf := resp.Encode()
+	s.Write(respBuf[:])
+}
+
+// handleAddLearner is ClientProtocolID's ActionAdd handler: req.Key is the
+// browser's own peer id, req.Value its reserved /p2p-circuit multiaddr (see
+// ClientProtocolID's doc comment). It adds that address to the raft
+// configuration as a non-voter directly if this node is the leader, or
+// forwards to whoever currently is (one hop only, over ForwardJoinProtocolID,
+// reusing the exact same wire path a voter join already forwards through --
+// see handleJoinStream) since the browser has no cheaper way to learn the
+// real leader than any other joining node does.
+func (n *Node) handleAddLearner(ctx context.Context, req ipcproto.Request) ipcproto.Response {
+	joinPeerID := req.KeyString()
+	joinAddr := req.ValueString()
+	if joinPeerID == "" || joinAddr == "" {
+		return ipcproto.NewResponse(ipcproto.StatusError, "client add: missing peer id or multiaddr")
+	}
+
+	rf := n.getRaft()
+	if rf != nil && rf.State() == raft.Leader {
+		if line := addServerLine(rf, joinPeerID, joinAddr, raft.Nonvoter); strings.HasPrefix(line, "ERR: ") {
+			return ipcproto.NewResponse(ipcproto.StatusError, strings.TrimPrefix(line, "ERR: "))
+		}
+		return ipcproto.NewResponse(ipcproto.StatusOK, n.peerID)
+	}
+
+	var leaderID raft.ServerID
+	if rf != nil {
+		_, leaderID = rf.LeaderWithID()
+	}
+	if leaderID == "" {
+		return ipcproto.NewResponse(ipcproto.StatusError, "client add: not leader and no leader known")
+	}
+
+	line, err := n.forwardJoin(ctx, leaderID, joinPeerID, joinAddr, raft.Nonvoter)
+	if err != nil {
+		return ipcproto.NewResponse(ipcproto.StatusError, "client add: forward: "+err.Error())
+	}
+	if reason, isErr := strings.CutPrefix(line, "ERR: "); isErr {
+		return ipcproto.NewResponse(ipcproto.StatusError, reason)
+	}
+	return ipcproto.NewResponse(ipcproto.StatusOK, n.peerID)
 }
 
 func (n *Node) handleGet(_ context.Context, req ipcproto.Request) ipcproto.Response {

@@ -23,6 +23,10 @@ network-facing RPC port.
   in-process inside an Android app (see `android-app/`).
 - `magefile.go` — desktop convenience targets (`mage addnode`, `mage set`, ...) that wrap
   `pkg/kvctl` for local development.
+- `web-app/` — a browser client, in Rust compiled to `wasm32-unknown-unknown` over `rust-libp2p`
+  (see [Client in a browser](#client-in-a-browser)); unlike every other client here it never
+  *votes*, but it does run a real hashicorp/raft non-voter (learner), reimplementing
+  `NetworkTransport`'s msgpack wire protocol to receive genuine `AppendEntries` replication.
 
 A node has no leader/follower role until it receives an `ActionAdd` request: bootstrap as the
 cluster's sole leader, or join an existing leader (given as a bare peer ID registered on the same
@@ -116,6 +120,43 @@ opening the stream at all, and the node also forces itself privately reachable w
 set rather than leaving that judgment to AutoNAT — and covered by a real relay+leader+follower
 cluster test (`pkg/daemon.TestJoinThroughRelay`). A plain direct join (no `relayMultiaddr`) has
 also been tested working from a phone on cellular data, joining a publicly reachable leader.
+
+### Client in a browser
+
+Unlike the desktop CLI and the Android app, a browser tab can never be a raft *voter*: a voter's
+transport must be independently dialable by any other voter at any time, and a browser sandbox has
+no way to accept a raw inbound connection. But it turns out a tab *can* be a raft **non-voter
+(learner)** once it holds a circuit-relay v2 reservation — the same mechanism a phone behind
+carrier-grade NAT already relies on (see [Relay reservations for NAT'd
+followers](#follower-on-android) above) — so `web-app/` is a real (if non-voting) member of the
+cluster, in Rust compiled to `wasm32-unknown-unknown` over `rust-libp2p`: it reimplements
+`hashicorp/raft`'s `NetworkTransport` msgpack wire protocol to receive genuine `AppendEntries`
+replication, backed by real SQLite (`sqlite-wasm-rs`) for the replicated log and kv table. Joining
+happens over a new libp2p protocol, `pkg/daemon.ClientProtocolID`'s `ActionAdd` handler
+(`handleAddLearner`), which calls `raft.AddNonvoter` — forwarding to the real leader server-side if
+the dialed node isn't it, one hop, mirroring how a voter's own join request forwards
+(`pkg/daemon.ForwardJoinProtocolID`). A Set still forwards to the leader the same way; a Get reads
+this tab's own locally-replicated state.
+
+Every node already listens on a browser-reachable WebTransport address (`newHost` adds it
+alongside the existing TCP/QUIC listeners); `advertisedAddrs()`/`ready.json` include it
+automatically, with its `/certhash` component already appended:
+
+```bash
+cat ~/.libp2p-kv-raft/registry.json   # listen_addrs includes .../quic-v1/webtransport/certhash/.../p2p/<peer-id>
+```
+
+```bash
+cd web-app
+npm install
+npm run dev   # builds the wasm bundle, then serves on a cross-origin-isolated origin
+```
+
+Paste that WebTransport multiaddr into the running page's "Node multiaddr" field and Connect —
+unlike Android's build-time-baked leader address (a phone has no operator to type one in), the web
+UI takes it at runtime, closer to desktop's `mage addfollower <addr>`. See `web-app/README.md` for
+the full architecture and its currently-unverified-in-CI gaps (needs a wasm32 C toolchain for
+SQLite, and a real browser + live cluster to exercise end to end).
 
 ## Vendored dependency patch
 

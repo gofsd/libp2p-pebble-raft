@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>libp2p-kv-raft web client</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 640px; margin: 2rem auto; padding: 0 1rem; }
+  label { display: block; margin-top: 1rem; font-weight: bold; }
+  input { width: 100%; box-sizing: border-box; padding: 0.4rem; font-family: inherit; }
+  button { margin-top: 0.75rem; margin-right: 0.5rem; padding: 0.4rem 1rem; }
+  #status, #result { margin-top: 1rem; padding: 0.6rem; border-radius: 6px; background: #f0f0f0; }
+</style>
+</head>
+<body>
+<h1>libp2p-kv-raft web client</h1>
+<p>This tab joins the raft cluster as a real, non-voting learner (over rust-libp2p, compiled to
+wasm) -- unlike the desktop CLI and the Android app it never votes in an election, but it does
+receive genuine AppendEntries replication and answers Get from its own locally-applied state, not
+just a request forwarded to a real voter. See <a href="README.md">README.md</a>.</p>
+
+<label for="nodeAddr">Node multiaddr (any cluster member; must include /webtransport/certhash and /p2p/&lt;peer-id&gt;)</label>
+<input id="nodeAddr" type="text" placeholder="/ip4/1.2.3.4/udp/4001/quic-v1/webtransport/certhash/.../p2p/12D3Koo...">
+<button id="connectButton">Connect</button>
+<div id="status">not connected</div>
+
+<label for="keyInput">Key</label>
+<input id="keyInput" type="text">
+<label for="valueInput">Value</label>
+<input id="valueInput" type="text">
+<button id="setButton" disabled>Set</button>
+<button id="getButton" disabled>Get</button>
+<div id="result"></div>
+
+<script type="module" src="/main.js"></script>
+</body>
+</html>

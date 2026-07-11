@@ -1,0 +1,23 @@
+[package]
+name = "kv-raft-web"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+console_error_panic_hook = "0.1.7"
+futures = "0.3.32"
+gloo-timers = { version = "0.4.0", features = ["futures"] }
+js-sys = "0.3.103"
+libp2p = { version = "0.56", features = ["noise", "yamux", "wasm-bindgen", "webtransport-websys", "relay", "macros"] }
+libp2p-stream = "0.4.0-alpha"
+shmring = "0.3.0"
+wasm-bindgen = "0.2.126"
+wasm-bindgen-futures = "0.4.76"
+web-sys = { version = "0.3.103", features = ["Worker", "MessageEvent", "DedicatedWorkerGlobalScope", "console"] }
+
+[target.wasm32-unknown-unknown.dependencies]
+getrandom = { version = "0.3", features = ["wasm_js"] }
+sqlite-wasm-rs = "0.5.5"
