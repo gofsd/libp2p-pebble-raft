@@ -35,6 +35,20 @@ import (
 // for on desktop.
 var leaderMultiaddr string
 
+// identitySeedHex, when set, is baked in at build time the same way as
+// leaderMultiaddr (via `gomobile bind -ldflags
+// "-X .../mobile/kvmobile.identitySeedHex=<128 hex chars>"`) to make this
+// device's identity deterministic instead of freshly random on first run --
+// what the e2e test pipeline needs so a build against a recorded
+// pkg/e2edata.Node reliably comes up as that exact peer id. The expected
+// format is 128 hex chars decoding to the 64 raw stdlib crypto/ed25519
+// private key bytes (32-byte seed + 32-byte public key) -- exactly
+// pkg/e2edata.Node.PrivateKey's own format, so a recorded node's key can be
+// pasted straight into the ldflag with no conversion. Left empty (the
+// default), ensureIdentity's existing random-on-first-run behavior is
+// unchanged.
+var identitySeedHex string
+
 // relayMultiaddr is baked in at build time the same way as leaderMultiaddr
 // (via `gomobile bind -ldflags "-X .../mobile/kvmobile.relayMultiaddr=..."`),
 // and is normally just the leader's own multiaddr, since the leader is
@@ -216,9 +230,9 @@ func ensureIdentity(dataDir string) (keyPath, peerID string, err error) {
 		return keyPath, pid.String(), nil
 	}
 
-	priv, _, err := crypto.GenerateKeyPair(crypto.Ed25519, -1)
+	priv, err := generateOrSeededKeyPair()
 	if err != nil {
-		return "", "", fmt.Errorf("kvmobile: generate key pair: %w", err)
+		return "", "", err
 	}
 	pid, err := peer.IDFromPrivateKey(priv)
 	if err != nil {
@@ -232,6 +246,28 @@ func ensureIdentity(dataDir string) (keyPath, peerID string, err error) {
 		return "", "", fmt.Errorf("kvmobile: write key file: %w", err)
 	}
 	return keyPath, pid.String(), nil
+}
+
+// generateOrSeededKeyPair returns a deterministic key derived from
+// identitySeedHex if set, or a freshly random one otherwise (this
+// package's original, still-default behavior).
+func generateOrSeededKeyPair() (crypto.PrivKey, error) {
+	if identitySeedHex == "" {
+		priv, _, err := crypto.GenerateKeyPair(crypto.Ed25519, -1)
+		if err != nil {
+			return nil, fmt.Errorf("kvmobile: generate key pair: %w", err)
+		}
+		return priv, nil
+	}
+	raw, err := hex.DecodeString(identitySeedHex)
+	if err != nil {
+		return nil, fmt.Errorf("kvmobile: decode identitySeedHex: %w", err)
+	}
+	priv, err := crypto.UnmarshalEd25519PrivateKey(raw)
+	if err != nil {
+		return nil, fmt.Errorf("kvmobile: unmarshal identitySeedHex: %w", err)
+	}
+	return priv, nil
 }
 
 // waitForReady polls for dataDir's ready file (written once the daemon's

@@ -10,12 +10,20 @@
 package main
 
 import (
+	"context"
+	"crypto/rand"
+	"encoding/binary"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
 	"strconv"
+	"time"
 
+	"github.com/gofsd/libp2p-kv-raft/pkg/e2edata"
+	"github.com/gofsd/libp2p-kv-raft/pkg/ipc"
 	"github.com/gofsd/libp2p-kv-raft/pkg/kvctl"
+	"github.com/gofsd/libp2p-kv-raft/pkg/shmevent"
 )
 
 func main() {
@@ -35,6 +43,8 @@ func main() {
 		cmdSet(os.Args[2:])
 	case "get":
 		cmdGet(os.Args[2:])
+	case "sendevent":
+		cmdSendEvent(os.Args[2:])
 	default:
 		usage()
 		os.Exit(2)
@@ -48,6 +58,19 @@ func usage() {
   kvctl-cli use <peerID>
   kvctl-cli set <key> <value>
   kvctl-cli get <key>
+  kvctl-cli sendevent <peerID> <eventJSON>
+
+sendevent sends one raw pkg/shmevent.Msg (JSON-encoded, e.g.
+'{"event":4,"value_hex":"68656c6c6f"}' -- see pkg/e2edata.Event for the
+field names, why value is hex not a plain string, and pkg/shmevent's event
+constants for the "event" byte) to peerID over the
+local shmring transport, signing it with peerID's own key when the event
+type requires one (fetched via an unsigned EventGetPrivateKey first). It
+prints the JSON response event to stdout and exits non-zero if the response
+is EventError (255) or the call itself failed. This is the low-level
+primitive the e2e test pipeline drives -- both locally and, since this
+binary is the one already cross-compiled and copied to remote deployment
+targets, identically over SSH against a remote node.
 
 raft flags (all default to hashicorp/raft's own WAN-appropriate values):
   -raft-heartbeat-timeout, -raft-election-timeout, -raft-commit-timeout, -raft-leader-lease-timeout`)
@@ -165,4 +188,78 @@ func cmdGet(args []string) {
 		os.Exit(1)
 	}
 	fmt.Println(value)
+}
+
+// sendEventTimeout bounds both the optional GetPrivateKey signing-key
+// fetch and the event call itself.
+const sendEventTimeout = 10 * time.Second
+
+func cmdSendEvent(args []string) {
+	if len(args) != 2 {
+		fmt.Fprintln(os.Stderr, "usage: kvctl-cli sendevent <peerID> <eventJSON>")
+		os.Exit(2)
+	}
+	peerID := args[0]
+
+	var ev e2edata.Event
+	if err := json.Unmarshal([]byte(args[1]), &ev); err != nil {
+		fmt.Fprintf(os.Stderr, "sendevent: parse event json: %v\n", err)
+		os.Exit(2)
+	}
+	if ev.ID == 0 {
+		ev.ID = randomID()
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), sendEventTimeout)
+	defer cancel()
+
+	var priv shmevent.PrivateKey
+	if shmevent.RequiresSignature(ev.EventType) {
+		keyResp, err := ipc.Call(ctx, peerID, shmevent.Msg{EventType: shmevent.EventGetPrivateKey, ID: randomID()}, nil)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "sendevent: fetch signing key: %v\n", err)
+			os.Exit(1)
+		}
+		if keyResp.EventType == shmevent.EventError {
+			fmt.Fprintf(os.Stderr, "sendevent: fetch signing key: %s\n", keyResp.Value)
+			os.Exit(1)
+		}
+		priv = shmevent.PrivateKey(keyResp.Value)
+	}
+
+	msg, err := ev.ToMsg()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "sendevent: %v\n", err)
+		os.Exit(2)
+	}
+	resp, err := ipc.Call(ctx, peerID, msg, priv)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "sendevent: %v\n", err)
+		os.Exit(1)
+	}
+
+	out, err := json.Marshal(e2edata.EventFromMsg(resp))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "sendevent: encode response: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println(string(out))
+	if resp.EventType == shmevent.EventError {
+		os.Exit(1)
+	}
+}
+
+// randomID returns a random non-zero id -- 0 is reserved meaning
+// "SourceID/DestinationID not used" (see api/shmevent.capnp), so a real
+// message's own id avoids it too.
+func randomID() uint16 {
+	for {
+		var b [2]byte
+		if _, err := rand.Read(b[:]); err != nil {
+			return 1
+		}
+		if id := binary.BigEndian.Uint16(b[:]); id != 0 {
+			return id
+		}
+	}
 }

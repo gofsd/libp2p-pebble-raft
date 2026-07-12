@@ -1,0 +1,32 @@
+#!/bin/sh
+# Runs before every `git push`, once `git config core.hooksPath` points here
+# (see `mage githooks:install`). Blocks the push if `mage e2e:current`
+# fails -- the rows recorded since the last published testdata.json
+# version (see pkg/e2edata.File.PendingRows) -- rather than every row ever
+# recorded (`mage e2e:all`), so a routine push isn't slowed down re-running
+# the whole history every time.
+#
+# Set SKIP_E2E=1 to bypass this for a push that genuinely can't reach the
+# e2e infrastructure (e.g. no network to the SSH bootstrap host) -- deliberate,
+# so the escape hatch is visible in the command line, not a silent --no-verify.
+
+if [ -n "$SKIP_E2E" ]; then
+	echo "pre-push: SKIP_E2E set, skipping mage e2e:current"
+	exit 0
+fi
+
+repo_root=$(git rev-parse --show-toplevel) || exit 1
+cd "$repo_root" || exit 1
+
+if ! command -v mage >/dev/null 2>&1; then
+	echo "pre-push: mage not found on PATH -- install it (see magefile.go) or push with SKIP_E2E=1 git push" >&2
+	exit 1
+fi
+
+echo "pre-push: running mage e2e:current..."
+if ! mage e2e:current; then
+	echo "pre-push: mage e2e:current failed -- push blocked. See test/e2e/testdata.json for per-row status/error, or push with SKIP_E2E=1 git push to bypass." >&2
+	exit 1
+fi
+
+exit 0

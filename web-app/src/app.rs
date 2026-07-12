@@ -85,13 +85,50 @@ struct WorkerState {
 
 /// Runs forever inside the Worker script (see `web-app/README.md`'s
 /// `worker.js`): brings up this tab's own `p2p::Node`, then answers every
-/// request the main thread sends over the shmring channel.
+/// request the main thread sends over the shmring channel. Generates a
+/// fresh random identity every time -- see `worker_main_with_seed` for a
+/// deterministic-identity variant.
 #[wasm_bindgen]
 pub async fn worker_main() {
+    run_worker(identity::Keypair::generate_ed25519()).await
+}
+
+/// Like `worker_main`, but with a deterministic identity instead of a
+/// freshly random one: `seed_hex` is 128 hex chars decoding to the 64 raw
+/// stdlib `crypto/ed25519` private key bytes (32-byte seed + 32-byte public
+/// key) -- exactly `pkg/e2edata.Node.PrivateKey`'s own format, so a
+/// recorded node's key can be passed straight through with no conversion.
+/// This is what the e2e test pipeline needs so a build against a recorded
+/// identity reliably comes up as that exact peer id (mirrors
+/// `mobile/kvmobile`'s `identitySeedHex` ldflag and
+/// `pkg/e2edata.WriteDesktopKeyFile`'s desktop equivalent). Returns an
+/// error string via `Err` if seed_hex doesn't decode to a valid key,
+/// instead of panicking -- a page driving this from JS can then report it
+/// instead of silently hanging.
+#[wasm_bindgen]
+pub async fn worker_main_with_seed(seed_hex: String) -> Result<(), JsValue> {
+    let raw = hex_decode(&seed_hex)
+        .map_err(|e| JsValue::from_str(&format!("worker_main_with_seed: decode seed_hex: {e}")))?;
+    if raw.len() != 64 {
+        return Err(JsValue::from_str(&format!(
+            "worker_main_with_seed: seed_hex must decode to 64 bytes (32-byte seed + 32-byte public key), got {}",
+            raw.len()
+        )));
+    }
+    let mut seed: [u8; 32] = raw[..32].try_into().expect("checked len above");
+    let keypair = identity::Keypair::ed25519_from_bytes(&mut seed[..])
+        .map_err(|e| JsValue::from_str(&format!("worker_main_with_seed: {e}")))?;
+    run_worker(keypair).await;
+    Ok(())
+}
+
+/// Shared body of `worker_main`/`worker_main_with_seed`: brings up this
+/// tab's own `p2p::Node` under keypair, then answers every request the
+/// main thread sends over the shmring channel.
+async fn run_worker(keypair: identity::Keypair) {
     console_error_panic_hook::set_once();
 
     let global: DedicatedWorkerGlobalScope = js_sys::global().unchecked_into();
-    let keypair = identity::Keypair::generate_ed25519();
 
     // libp2p_identity::ed25519::Keypair wraps its own ed25519-dalek
     // SigningKey, not necessarily the same major version this crate
@@ -102,7 +139,7 @@ pub async fn worker_main() {
     let ed25519_kp = keypair
         .clone()
         .try_into_ed25519()
-        .expect("just generated as ed25519");
+        .expect("keypair is always constructed as ed25519 by worker_main/worker_main_with_seed");
     let kp_bytes = ed25519_kp.to_bytes();
     let seed: [u8; 32] = kp_bytes[..32]
         .try_into()
@@ -135,6 +172,26 @@ pub async fn worker_main() {
         let state = state.clone();
         async move { handle_request(state, req, crc, sig).await }
     });
+}
+
+/// Minimal hex decoder so `worker_main_with_seed` doesn't need to pull in
+/// a whole `hex` crate dependency for one call site.
+fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
+    if s.len() % 2 != 0 {
+        return Err("odd-length hex string".to_string());
+    }
+    let mut out = Vec::with_capacity(s.len() / 2);
+    let bytes = s.as_bytes();
+    for chunk in bytes.chunks(2) {
+        let hi = (chunk[0] as char)
+            .to_digit(16)
+            .ok_or_else(|| format!("invalid hex digit {:?}", chunk[0] as char))?;
+        let lo = (chunk[1] as char)
+            .to_digit(16)
+            .ok_or_else(|| format!("invalid hex digit {:?}", chunk[1] as char))?;
+        out.push(((hi << 4) | lo) as u8);
+    }
+    Ok(out)
 }
 
 /// Dispatches one decoded main-thread request the same way

@@ -54,9 +54,13 @@ is what "learner" means here and in the Raft paper itself.
   `backend::SharedArrayBufferStorage` "exactly like the native backend"). Mirrors
   `pkg/ipc/ipc_android.go`'s Call/Serve pattern: each round trip gets a fresh, single-use pair of
   rings, and only one call is ever in flight at a time.
-- `src/app.rs` -- wires all of the above into the two `wasm-bindgen` entry points a page actually
+- `src/app.rs` -- wires all of the above into the `wasm-bindgen` entry points a page actually
   loads: `worker_main()` (run inside the Worker; owns the `p2p::Node`, the `Learner`, its own
-  `shmevent` key registry, and answers every request from the main thread) and `MainHandle` (run on
+  `shmevent` key registry, and answers every request from the main thread), `worker_main_with_seed(seed_hex)`
+  (the same, but with a deterministic identity decoded from `seed_hex` instead of a freshly random
+  one -- the same 128-hex-char raw stdlib `crypto/ed25519` private key format `pkg/e2edata.Node.PrivateKey`
+  and `mobile/kvmobile`'s `identitySeedHex` ldflag use, so the e2e test pipeline's recorded node
+  identities work unmodified here too), and `MainHandle` (run on
   the main thread; `connect`/`set`/`get`). Two separate Ed25519 keys are in play -- the Worker's own
   identity key secures the main-thread/Worker hop, and a key fetched from the remote leader during
   `connect` secures the `ClientProtocolID` hop -- see `app.rs`'s doc comment for why both exist.

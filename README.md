@@ -184,6 +184,36 @@ effect.
 ```bash
 mage test          # unit tests
 mage integration    # integration tests
-mage e2e            # end-to-end tests
-mage testall        # all of the above
+mage testall        # all of the above, plus every e2e:all row (see below)
 ```
+
+### End-to-end tests / deploy pipeline
+
+`test/e2e/testdata.json` is the single source of truth for the e2e suite: a version history,
+deterministic Ed25519 identities per platform (desktop/android/web), and a recorded log of test
+rows -- each one raw `pkg/shmevent.Msg` sent to a node, with the last run's pass/fail status and
+error message. See `pkg/e2edata` for the file format and `pkg/e2erun` for what running a row
+actually does per platform (a real locally-spawned `kvnode` for desktop, a real
+Playwright-driven browser check for web, and -- since no on-device/emulator build automation
+exists yet -- a clearly marked skip for android).
+
+```bash
+mage e2e:newversion "<label>"                              # start a new version
+mage e2e:addnode desktop                                    # generate a deterministic identity
+mage e2e:addtest <nodeID> <event> <id> <sourceID> <destID> <value>  # record a row against it
+mage e2e:bootstrap                                           # deploy/confirm the shared leader (SSH)
+mage e2e:current                                              # run only rows newer than the last published version
+mage e2e:all                                                   # run every recorded row
+```
+
+`mage e2e:current` is what runs before every push once installed:
+
+```bash
+mage githooks:install   # one-time: points core.hooksPath at scripts/git-hooks/pre-push
+```
+
+The shared bootstrap/leader node these tests join against is deployed over SSH to a single,
+already-provisioned VPS, into its own isolated directory/port (`pkg/e2erun.BootstrapRemoteDir`,
+distinct from any other node manually running on that same host) -- `mage e2e:bootstrap` (or the
+first `e2e:current`/`e2e:all` run) is idempotent: it deploys and starts it only if not already up,
+and otherwise just confirms it's reachable.

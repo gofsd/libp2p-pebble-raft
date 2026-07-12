@@ -15,7 +15,10 @@ import (
 	"github.com/magefile/mage/mg"
 	"github.com/magefile/mage/sh"
 
+	"github.com/gofsd/libp2p-kv-raft/pkg/e2edata"
+	"github.com/gofsd/libp2p-kv-raft/pkg/e2erun"
 	"github.com/gofsd/libp2p-kv-raft/pkg/kvctl"
+	"github.com/gofsd/libp2p-kv-raft/pkg/shmevent"
 )
 
 // Default target to run if none is specified
@@ -146,14 +149,216 @@ func Integration() error {
 	return cmd.Run()
 }
 
-// E2e runs the end-to-end test suite
-func E2e() error {
-	fmt.Println("Running End-to-End (E2E) Tests...")
-	// -tags=e2e tells Go to include files with the '//go:build e2e' tag
-	cmd := exec.Command("go", "test", "-v", "-tags=e2e", "./...")
+// E2E groups the end-to-end test/deploy pipeline behind `mage e2e:<method>`
+// -- see pkg/e2edata for the single testdata file format (versions, node
+// identities, test rows) and pkg/e2erun for what actually deploying and
+// running a row means per platform.
+//
+// This replaced a stub `E2e()` target that ran `go test -tags=e2e ./...`
+// against a build tag no file in this repo ever used -- i.e. it always
+// silently did nothing. mg.Namespace also can't coexist with a same-named
+// bare function target (mage's CLI target discovery would collide "e2e"
+// the function against "e2e:" the namespace prefix), so replacing it was
+// required, not optional, to add these targets at all.
+type E2E mg.Namespace
+
+func testdataPath() (string, error) {
+	root, err := repoRoot()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(root, e2edata.DefaultPath), nil
+}
+
+// NewVersion records a new version labeled label so subsequent
+// `e2e:addtest` calls target it instead of whatever version was current
+// before.
+//
+// Usage: mage e2e:newversion "<label>"
+func (E2E) NewVersion(label string) error {
+	path, err := testdataPath()
+	if err != nil {
+		return err
+	}
+	f, err := e2edata.Load(path)
+	if err != nil {
+		return err
+	}
+	id := f.NewVersion(label)
+	if err := f.Save(path); err != nil {
+		return err
+	}
+	fmt.Printf("✅ version %d: %s\n", id, label)
+	return nil
+}
+
+// AddNode generates a fresh deterministic Ed25519 identity for platform
+// ("desktop", "android", or "web") and records it, printing the node id
+// later e2e:addtest calls reference.
+//
+// Usage: mage e2e:addnode <platform>
+func (E2E) AddNode(platform string) error {
+	path, err := testdataPath()
+	if err != nil {
+		return err
+	}
+	f, err := e2edata.Load(path)
+	if err != nil {
+		return err
+	}
+	id, node, err := f.AddNode(e2edata.Platform(platform))
+	if err != nil {
+		return err
+	}
+	if err := f.Save(path); err != nil {
+		return err
+	}
+	fmt.Printf("✅ node %d (%s): %s\n", id, node.Platform, node.PeerID)
+	return nil
+}
+
+// AddTest appends a test row against the current (not yet published)
+// version -- creating version 1 automatically if none exists yet -- that
+// sends one raw pkg/shmevent to nodeID: event is the event type byte (see
+// pkg/shmevent's EventSetKey..EventAdd constants), id is this message's own
+// correlation id (pick a nonzero value and reuse it as a later row's
+// sourceID/destID to link them -- e.g. a SetKey row with id=100 followed by
+// a SetField row with sourceID=100 -- since pkg/e2erun dispatches rows
+// through kvctl-cli sendevent, which only randomizes an id left at its
+// zero value, an explicit id here is preserved exactly through to the
+// wire), sourceID/destID are the relational reference fields (0 for
+// unused), and value is a plain string (hex-encoded internally -- see
+// pkg/e2edata.Event's doc comment on why). An EventAdd row's value may be
+// the literal string "BOOTSTRAP" to mean "the live bootstrap leader's
+// address, whatever it is at run time" (see pkg/e2erun.BootstrapToken)
+// instead of a frozen address.
+//
+// Usage: mage e2e:addtest <nodeID> <event> <id> <sourceID> <destID> <value>
+func (E2E) AddTest(nodeID, event, id, sourceID, destID int, value string) error {
+	path, err := testdataPath()
+	if err != nil {
+		return err
+	}
+	f, err := e2edata.Load(path)
+	if err != nil {
+		return err
+	}
+	ev := e2edata.NewEvent(uint8(event), uint16(sourceID), uint16(destID), []byte(value), uint16(id))
+	row, err := f.AddTest(nodeID, ev)
+	if err != nil {
+		return err
+	}
+	if err := f.Save(path); err != nil {
+		return err
+	}
+	fmt.Printf("✅ added row: version %d, node %d, event %s\n", row.Version, row.Node, shmevent.EventName(ev.EventType))
+	return nil
+}
+
+// Bootstrap deploys (or confirms already running, idempotently) the shared
+// e2e bootstrap/leader node on the SSH server -- see
+// pkg/e2erun.EnsureBootstrap for exactly what that involves and how it
+// avoids disturbing any other node already running there.
+//
+// Usage: mage e2e:bootstrap
+func (E2E) Bootstrap() error {
+	root, err := repoRoot()
+	if err != nil {
+		return err
+	}
+	path, err := testdataPath()
+	if err != nil {
+		return err
+	}
+	f, err := e2edata.Load(path)
+	if err != nil {
+		return err
+	}
+	multiaddr, peerID, err := e2erun.EnsureBootstrap(root, path, f)
+	if err != nil {
+		return err
+	}
+	if err := f.Save(path); err != nil {
+		return err
+	}
+	fmt.Printf("✅ bootstrap %s ready at %s\n", peerID, multiaddr)
+	return nil
+}
+
+// Current runs only the rows recorded since the last published version --
+// what should run before every push (see the pre-push hook in
+// scripts/git-hooks/pre-push). On full success it advances
+// PublishedVersion, so the next e2e:current only covers whatever's new
+// again -- this is the "version increment based on new tests" behavior.
+//
+// Usage: mage e2e:current
+func (E2E) Current() error {
+	return runE2ERows(func(f *e2edata.File) []int { return f.PendingRows() }, true)
+}
+
+// All runs every recorded test row across every version, regardless of
+// what's already published -- a full regression pass.
+//
+// Usage: mage e2e:all
+func (E2E) All() error {
+	return runE2ERows(func(f *e2edata.File) []int { return f.AllRowIndices() }, false)
+}
+
+func runE2ERows(selectRows func(*e2edata.File) []int, markPublishedOnSuccess bool) error {
+	root, err := repoRoot()
+	if err != nil {
+		return err
+	}
+	path, err := testdataPath()
+	if err != nil {
+		return err
+	}
+	f, err := e2edata.Load(path)
+	if err != nil {
+		return err
+	}
+	rows := selectRows(f)
+	if len(rows) == 0 {
+		fmt.Println("✅ no rows to run")
+		return nil
+	}
+	runErr := e2erun.Run(root, path, f, rows)
+	if runErr == nil && markPublishedOnSuccess {
+		f.MarkPublished()
+		if err := f.Save(path); err != nil {
+			return err
+		}
+	}
+	return runErr
+}
+
+// Githooks groups git hook installation behind `mage githooks:<method>`.
+type Githooks mg.Namespace
+
+// Install points this repo's core.hooksPath at scripts/git-hooks, so the
+// pre-push hook there (which runs `mage e2e:current`, blocking a push if
+// it fails) actually runs -- see that file's own doc comment for the
+// SKIP_E2E escape hatch. Idempotent and safe to re-run.
+//
+// Usage: mage githooks:install
+func (Githooks) Install() error {
+	root, err := repoRoot()
+	if err != nil {
+		return err
+	}
+	hooksDir := filepath.Join(root, "scripts", "git-hooks")
+	if err := os.Chmod(filepath.Join(hooksDir, "pre-push"), 0o755); err != nil {
+		return fmt.Errorf("githooks: %w", err)
+	}
+	cmd := exec.Command("git", "config", "core.hooksPath", "scripts/git-hooks")
+	cmd.Dir = root
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	return cmd.Run()
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("githooks: set core.hooksPath: %w", err)
+	}
+	fmt.Println("✅ core.hooksPath set to scripts/git-hooks -- `mage e2e:current` now runs before every push")
+	return nil
 }
 
 // TestAll runs absolutely every test type sequentially
@@ -166,7 +371,7 @@ func TestAll() error {
 	if err := Integration(); err != nil {
 		return err
 	}
-	if err := E2e(); err != nil {
+	if err := (E2E{}).All(); err != nil {
 		return err
 	}
 

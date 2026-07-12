@@ -1,0 +1,69 @@
+{
+  "versions": {
+    "1": "smoke test: join bootstrap + set/get round trip"
+  },
+  "published_version": 1,
+  "bootstrap_node": 2,
+  "nodes": {
+    "1": {
+      "platform": "desktop",
+      "peer_id": "12D3KooWHbxvpCETmVYhhgy8HFy8S3ac1NsJBdRpZvguqRnG321J",
+      "public_key": "73b03f7a0e7c82964d6c7b947745f8e4e5934a5b08d1038f2c9ef5b112834e95",
+      "private_key": "6025150c8e2cf11d09f3ed4f30bbb464c84a0cca631764df16747a0a5dcb44bd73b03f7a0e7c82964d6c7b947745f8e4e5934a5b08d1038f2c9ef5b112834e95"
+    },
+    "2": {
+      "platform": "desktop",
+      "peer_id": "12D3KooWPKG8Jfu2pjh8vRi8JW4CLzn7YpKVxmuyihu3o3vhE9nd",
+      "public_key": "c88ef115a8b7c8c38c7aca36aea4cfeece8be72a5ee324d079ccac728d34cd9e",
+      "private_key": "8292132027d7138303b0cde60e53e3dd1f8d67f6c724f0da26eded4601af6ac6c88ef115a8b7c8c38c7aca36aea4cfeece8be72a5ee324d079ccac728d34cd9e"
+    }
+  },
+  "rows": [
+    {
+      "version": 1,
+      "node": 1,
+      "event": {
+        "event": 7,
+        "value_hex": "424f4f545354524150"
+      },
+      "status": 0
+    },
+    {
+      "version": 1,
+      "node": 1,
+      "event": {
+        "event": 5
+      },
+      "status": 0
+    },
+    {
+      "version": 1,
+      "node": 1,
+      "event": {
+        "event": 1,
+        "value_hex": "68656c6c6f",
+        "id": 100
+      },
+      "status": 0
+    },
+    {
+      "version": 1,
+      "node": 1,
+      "event": {
+        "event": 2,
+        "source_id": 100,
+        "value_hex": "776f726c64"
+      },
+      "status": 0
+    },
+    {
+      "version": 1,
+      "node": 1,
+      "event": {
+        "event": 4,
+        "value_hex": "68656c6c6f"
+      },
+      "status": 0
+    }
+  ]
+}
