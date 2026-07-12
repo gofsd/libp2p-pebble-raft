@@ -47,10 +47,19 @@ const BootstrapToken = "BOOTSTRAP"
 // the bootstrap's live, dialable multiaddr (read back from its own
 // ready.json over ssh) and its peer id.
 //
+// multiaddr is address [0] of advertisedAddrs()'s own best-first ordering
+// (see pkg/daemon.advertisedAddrs's doc comment) -- a plain TCP/QUIC
+// address every Go-based platform (desktop, remote, Android's go-libp2p)
+// can dial directly. webTransportAddr is separately the
+// /quic-v1/webtransport/... address specifically, since a browser sandbox
+// can *only* dial WebTransport, never raw TCP/QUIC -- using multiaddr for
+// a web row's "BOOTSTRAP" placeholder would silently try to connect a
+// browser tab to an address it can never reach.
+//
 // Deployment is idempotent: re-running this after the daemon is already up
-// just confirms it's alive and returns its current address -- safe to call
-// at the start of every e2e:current/e2e:all invocation. path is saved to
-// immediately after provisioning the PlatformRemote identity (if none
+// just confirms it's alive and returns its current addresses -- safe to
+// call at the start of every e2e:current/e2e:all invocation. path is saved
+// to immediately after provisioning the PlatformRemote identity (if none
 // existed yet), before any remote action is taken -- a newly generated
 // identity that dies with this process before ever reaching disk would
 // otherwise get silently regenerated (and so *changed*) on the next
@@ -58,61 +67,96 @@ const BootstrapToken = "BOOTSTRAP"
 // original identity's key file remotely; caught by hitting exactly that
 // after a first deploy attempt failed partway through for an unrelated
 // reason.
-func EnsureBootstrap(repoRoot, path string, f *e2edata.File) (multiaddr, peerID string, err error) {
+func EnsureBootstrap(repoRoot, path string, f *e2edata.File) (multiaddr, webTransportAddr, peerID string, err error) {
 	_, node, ok := f.RemoteNode()
 	if !ok {
 		var err error
 		_, node, err = f.AddNode(e2edata.PlatformRemote)
 		if err != nil {
-			return "", "", fmt.Errorf("e2erun: provision bootstrap identity: %w", err)
+			return "", "", "", fmt.Errorf("e2erun: provision bootstrap identity: %w", err)
 		}
 		if err := f.Save(path); err != nil {
-			return "", "", fmt.Errorf("e2erun: save provisioned bootstrap identity: %w", err)
+			return "", "", "", fmt.Errorf("e2erun: save provisioned bootstrap identity: %w", err)
 		}
 	}
 
 	binDir, err := buildLinuxAmd64Binaries(repoRoot)
 	if err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
 
-	if err := deployIfMissing(binDir); err != nil {
-		return "", "", err
+	redeployed, err := deployIfMissing(binDir)
+	if err != nil {
+		return "", "", "", err
 	}
-	if err := deployKeyIfMissing(node); err != nil {
-		return "", "", err
+	alreadyBootstrapped, err := deployKeyIfMissing(node)
+	if err != nil {
+		return "", "", "", err
+	}
+	if redeployed {
+		// A new binary alone doesn't make an already-running daemon pick
+		// it up -- force a restart so it does. Safe: raft's own on-disk
+		// state means the restarted process loses nothing (see
+		// stopIfRunning's doc comment).
+		if err := stopIfRunning(); err != nil {
+			return "", "", "", err
+		}
 	}
 	justStarted, err := startIfNotRunning()
 	if err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
 
 	ready, err := waitRemoteReady(BootstrapRemoteDir+"/data", readyTimeout)
 	if err != nil {
-		return "", "", fmt.Errorf("e2erun: bootstrap not ready: %w", err)
+		return "", "", "", fmt.Errorf("e2erun: bootstrap not ready: %w", err)
 	}
 	if ready.PeerID != node.PeerID {
-		return "", "", fmt.Errorf("e2erun: bootstrap peer id mismatch: deployed identity is %s but running daemon reports %s (stale /root/kvstore-e2e data from a different identity?)", node.PeerID, ready.PeerID)
+		return "", "", "", fmt.Errorf("e2erun: bootstrap peer id mismatch: deployed identity is %s but running daemon reports %s (stale /root/kvstore-e2e data from a different identity?)", node.PeerID, ready.PeerID)
 	}
 	if len(ready.ListenAddrs) == 0 {
-		return "", "", fmt.Errorf("e2erun: bootstrap reported no listen addresses")
+		return "", "", "", fmt.Errorf("e2erun: bootstrap reported no listen addresses")
 	}
 
-	if justStarted {
-		// A freshly spawned kvnode has no raft configuration at all --
-		// EventAdd with SourceID 0 and an empty Value is what
+	if justStarted && !alreadyBootstrapped {
+		// A genuinely first-ever-started kvnode has no raft configuration
+		// at all -- EventAdd with SourceID 0 and an empty Value is what
 		// pkg/daemon.handleAdd reads as "bootstrap as the cluster's sole
 		// leader" (see pkg/shmevent.EventAdd's doc comment). Without this,
 		// the daemon just sits there correctly rejecting every join
 		// attempt with "not leader" -- caught by a real join row failing
 		// with exactly that error against a freshly deployed bootstrap.
+		//
+		// Gated on !alreadyBootstrapped too, not just justStarted: a
+		// restart forced by redeploying a new binary (see the `redeployed`
+		// branch above) also makes justStarted true, but that daemon
+		// already has persisted raft state and resumes it on its own (see
+		// pkg/daemon.Run's hasState check) -- sending it another
+		// self-leader EventAdd would hit BootstrapCluster's own refusal to
+		// re-bootstrap a non-empty log and fail this whole call.
 		status, errMsg := sendEventRemote(node.PeerID, e2edata.NewEvent(shmevent.EventAdd, 0, 0, nil, 0))
 		if status != e2edata.StatusPass {
-			return "", "", fmt.Errorf("e2erun: bootstrap self-leader EventAdd: %s", errMsg)
+			return "", "", "", fmt.Errorf("e2erun: bootstrap self-leader EventAdd: %s", errMsg)
 		}
 	}
 
-	return ready.ListenAddrs[0], node.PeerID, nil
+	wt := findWebTransportAddr(ready.ListenAddrs)
+	return ready.ListenAddrs[0], wt, node.PeerID, nil
+}
+
+// findWebTransportAddr returns the first /webtransport/ address in addrs,
+// or "" if none is present (e.g. an older deployment's ready.json, or a
+// node that somehow never advertised one) -- callers driving a web row
+// should treat that as "no browser-reachable address available" rather
+// than silently falling back to a plain TCP/QUIC address a browser can
+// never dial.
+func findWebTransportAddr(addrs []string) string {
+	for _, a := range addrs {
+		if strings.Contains(a, "/webtransport/") {
+			return a
+		}
+	}
+	return ""
 }
 
 // ResolveBootstrapPlaceholder replaces BootstrapToken with the live
@@ -162,26 +206,32 @@ func buildLinuxAmd64Binaries(repoRoot string) (string, error) {
 // deploy against a live bootstrap to surface), while `mv`'s rename leaves
 // the running process's already-open inode untouched and just repoints
 // the path for whatever starts next.
-func deployIfMissing(binDir string) error {
+// deployIfMissing uploads kvnode/kvctl-cli if the remote binary differs in
+// size from the freshly-built local one. deployed reports whether anything
+// was actually re-uploaded -- EnsureBootstrap uses this to force a restart
+// of an already-running daemon, since deploying a new binary alone doesn't
+// make a live process pick it up.
+func deployIfMissing(binDir string) (deployed bool, err error) {
 	if err := sshRun(BootstrapHost, fmt.Sprintf("mkdir -p %s/bin %s/data", BootstrapRemoteDir, BootstrapRemoteDir)); err != nil {
-		return err
+		return false, err
 	}
 	for _, name := range []string{"kvnode", "kvctl-cli"} {
 		local := filepath.Join(binDir, name)
 		remote := BootstrapRemoteDir + "/bin/" + name
 		localInfo, err := os.Stat(local)
 		if err != nil {
-			return err
+			return deployed, err
 		}
 		out, err := sshOutput(BootstrapHost, fmt.Sprintf("stat -c%%s %s 2>/dev/null || true", remote))
 		if err == nil && fmt.Sprintf("%d\n", localInfo.Size()) == out {
 			continue // already deployed, same size
 		}
 		if err := uploadWithRetry(local, BootstrapHost, remote, localInfo.Size()); err != nil {
-			return err
+			return deployed, err
 		}
+		deployed = true
 	}
-	return nil
+	return deployed, nil
 }
 
 // uploadRetries bounds how many times uploadWithRetry re-sends a binary
@@ -220,22 +270,31 @@ func uploadWithRetry(local, host, remote string, localSize int64) error {
 	return fmt.Errorf("e2erun: upload %s: %w", local, lastErr)
 }
 
-func deployKeyIfMissing(node e2edata.Node) error {
+// deployKeyIfMissing writes node's identity key remotely if it isn't there
+// yet. alreadyDeployed reports whether it already was -- true means this
+// node has been bootstrapped before (on some earlier EnsureBootstrap call,
+// possibly a much earlier process lifetime than whatever's running now), so
+// it already has its own persisted raft state and must never be sent
+// another self-leader EventAdd bootstrap, regardless of whether the current
+// process happens to have been freshly (re)started -- unlike justStarted,
+// this stays true across a restart triggered by a binary redeploy (see
+// EnsureBootstrap's use of this return value).
+func deployKeyIfMissing(node e2edata.Node) (alreadyDeployed bool, err error) {
 	remoteKey := BootstrapRemoteDir + "/data/identity.key"
 	out, _ := sshOutput(BootstrapHost, "cat "+remoteKey+" 2>/dev/null || true")
 	if out != "" {
-		return nil // already deployed
+		return true, nil // already deployed
 	}
 	tmp, err := os.CreateTemp("", "kvstore-e2e-bootstrap-key-*")
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer os.Remove(tmp.Name())
 	tmp.Close()
 	if err := e2edata.WriteDesktopKeyFile(node, tmp.Name()); err != nil {
-		return err
+		return false, err
 	}
-	return scp(tmp.Name(), BootstrapHost, remoteKey)
+	return false, scp(tmp.Name(), BootstrapHost, remoteKey)
 }
 
 // bootstrapPidFile is where startIfNotRunning records the daemon's pid, so
@@ -248,14 +307,21 @@ func deployKeyIfMissing(node e2edata.Node) error {
 // against the real server before trusting it.
 const bootstrapPidFile = BootstrapRemoteDir + "/data/e2e.pid"
 
+// bootstrapDaemonAlive reports whether bootstrapPidFile names a still-live
+// remote pid (over ssh) -- distinct from this package's local-process
+// isAlive(pid int) helper.
+func bootstrapDaemonAlive() bool {
+	out, _ := sshOutput(BootstrapHost, fmt.Sprintf("kill -0 \"$(cat %s 2>/dev/null)\" 2>/dev/null && echo alive || true", bootstrapPidFile))
+	return strings.TrimSpace(out) == "alive"
+}
+
 // startIfNotRunning starts the bootstrap kvnode over ssh unless
 // bootstrapPidFile names a still-live pid, in which case it's a no-op.
 // justStarted reports which happened -- EnsureBootstrap only needs to send
 // the self-leader EventAdd bootstrap request the first time a daemon is
 // actually started, not on every idempotent "already running" check.
 func startIfNotRunning() (justStarted bool, err error) {
-	out, _ := sshOutput(BootstrapHost, fmt.Sprintf("kill -0 \"$(cat %s 2>/dev/null)\" 2>/dev/null && echo alive || true", bootstrapPidFile))
-	if strings.TrimSpace(out) == "alive" {
+	if bootstrapDaemonAlive() {
 		return false, nil // already running
 	}
 	// setsid fully detaches the daemon into its own session, immune to
@@ -267,14 +333,46 @@ func startIfNotRunning() (justStarted bool, err error) {
 	// anyway. `< /dev/null` matters too: leaving stdin attached to the
 	// ssh channel is enough on its own to keep the session from being
 	// considered closed.
+	//
+	// -raft-snapshot-threshold/-raft-snapshot-interval/-raft-trailing-logs
+	// are set well below hashicorp/raft's own defaults (8192 entries /
+	// 120s / 10240 entries) specifically because this leader is never torn
+	// down between e2e runs (see this file's doc comment) -- its log only
+	// ever grows, and a freshly-joined non-voter must replay everything
+	// from index 1 up to the last snapshot. Confirmed directly: without
+	// this, a browser tab joining after ~1470 accumulated log entries
+	// needed 20-30+ seconds just to catch up before it could read back its
+	// own just-written value. All three matter together: a lowered
+	// threshold alone still snapshots without compacting anything, since a
+	// log under the (still-default) TrailingLogs entries has nothing
+	// eligible for removal regardless of how often it snapshots.
 	remoteCmd := fmt.Sprintf(
-		"setsid %[1]s/bin/kvnode -data-dir %[1]s/data -key-path %[1]s/data/identity.key -listen-port %[2]d -relay-service >%[1]s/daemon.log 2>&1 </dev/null & echo $! >%[3]s",
+		"setsid %[1]s/bin/kvnode -data-dir %[1]s/data -key-path %[1]s/data/identity.key -listen-port %[2]d -relay-service -raft-snapshot-threshold 256 -raft-snapshot-interval 30s -raft-trailing-logs 256 >%[1]s/daemon.log 2>&1 </dev/null & echo $! >%[3]s",
 		BootstrapRemoteDir, BootstrapRemotePort, bootstrapPidFile,
 	)
 	if err := sshRun(BootstrapHost, remoteCmd); err != nil {
 		return false, err
 	}
 	return true, nil
+}
+
+// stopIfRunning kills the bootstrap daemon by the exact pid recorded in
+// bootstrapPidFile (never by a `pkill`-style pattern match, same reasoning
+// as bootstrapPidFile's own doc comment) and waits for it to actually exit,
+// so a subsequent startIfNotRunning reliably launches the new binary rather
+// than racing the old process's shutdown. A no-op if nothing is running.
+// Raft's own on-disk log/snapshot state (BoltDB + the file snapshot store)
+// makes this safe: the restarted process rebuilds its raft.Raft from
+// exactly what was already persisted, losing nothing.
+func stopIfRunning() error {
+	if !bootstrapDaemonAlive() {
+		return nil // not running
+	}
+	waitCmd := fmt.Sprintf(
+		"pid=\"$(cat %s)\"; kill \"$pid\" 2>/dev/null; for i in $(seq 1 50); do kill -0 \"$pid\" 2>/dev/null || exit 0; sleep 0.2; done; kill -9 \"$pid\" 2>/dev/null || true",
+		bootstrapPidFile,
+	)
+	return sshRun(BootstrapHost, waitCmd)
 }
 
 const readyTimeout = 30 * time.Second

@@ -141,6 +141,35 @@ type Config struct {
 	ElectionTimeout    time.Duration
 	CommitTimeout      time.Duration
 	LeaderLeaseTimeout time.Duration
+
+	// SnapshotThreshold/SnapshotInterval bound how large a long-lived
+	// leader's raft log is allowed to grow between compactions. Zero means
+	// "use hashicorp/raft's own default" (8192 entries / 120s), which is
+	// tuned for a cluster that mostly just needs *a* periodic snapshot, not
+	// one where a brand new non-voter might join long after the log has
+	// grown into the thousands: every fresh join replays the entire log
+	// from index 1 up to the most recent snapshot, one entry at a time, so
+	// a leader that's been running a long time without ever snapshotting
+	// makes every subsequent join progressively slower -- observed directly
+	// against this project's own long-lived e2e deploy target, where a
+	// newly-joined browser tab had to replay well over a thousand mostly-
+	// empty heartbeat entries before reaching the one write it actually
+	// needed. A lower threshold trades more frequent (cheap, incremental)
+	// snapshotting for a join's replay being bounded by TrailingLogs
+	// instead of the leader's entire lifetime log.
+	SnapshotThreshold uint64
+	SnapshotInterval  time.Duration
+
+	// TrailingLogs is how many of the most recent log entries a snapshot
+	// leaves in place instead of compacting away. Zero means hashicorp/
+	// raft's own default (10240), which -- combined with a lowered
+	// SnapshotThreshold above -- can still leave a snapshot compacting
+	// nothing at all: a log under 10240 entries total has nothing eligible
+	// for removal regardless of how often it snapshots, so a fresh non-
+	// voter join still replays the whole thing. Set this alongside
+	// SnapshotThreshold, not instead of it, for a snapshot to actually
+	// shrink what a new join has to replay.
+	TrailingLogs uint64
 }
 
 // Node is a running daemon instance. Its raft/transport fields are nil
@@ -407,6 +436,15 @@ func (n *Node) initRaft() (*raft.Raft, error) {
 	}
 	if n.cfg.LeaderLeaseTimeout > 0 {
 		raftConf.LeaderLeaseTimeout = n.cfg.LeaderLeaseTimeout
+	}
+	if n.cfg.SnapshotThreshold > 0 {
+		raftConf.SnapshotThreshold = n.cfg.SnapshotThreshold
+	}
+	if n.cfg.SnapshotInterval > 0 {
+		raftConf.SnapshotInterval = n.cfg.SnapshotInterval
+	}
+	if n.cfg.TrailingLogs > 0 {
+		raftConf.TrailingLogs = n.cfg.TrailingLogs
 	}
 	if logFile, err := os.OpenFile(filepath.Join(n.cfg.DataDir, "raft.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644); err == nil {
 		raftConf.LogOutput = logFile
@@ -748,14 +786,29 @@ func (n *Node) join(ctx context.Context, leaderAddr string) error {
 	// multistream-select handshake to the stream's first Write (see
 	// msmux.NewMSSelect) -- but the remote's own DefaultNegotiationTimeout
 	// (10s) starts ticking the moment it sees the raw stream open, not when
-	// bytes first arrive on it. An awaitRelayAddr wait sitting between
-	// NewStream and the first Write can easily outlast that 10s window,
-	// so the remote resets the stream (StreamProtocolNegotiationFailed)
-	// before our write -- which is the join request itself -- ever reaches
-	// it. Observed directly: this is why joins reliably failed whenever
-	// RelayPeer was set, and never when it was empty (awaitRelayAddr is a
-	// no-op then, so the write follows NewStream within milliseconds).
-	n.awaitRelayAddr(15 * time.Second)
+	// bytes first arrive on it. Waiting here, before NewStream is ever
+	// called, sidesteps that negotiation-timeout risk entirely (an earlier
+	// version awaited between NewStream and the first Write instead, and
+	// joins reliably failed with StreamProtocolNegotiationFailed whenever
+	// RelayPeer was set as a result) -- so this wait is free to be as long
+	// as a reservation genuinely needs, not bounded by that 10s window.
+	//
+	// A reservation that doesn't complete within this wait isn't just a
+	// slower join: awaitRelayAddr gives up silently either way, and
+	// whatever address n.host.Addrs() has *then* -- a real /p2p-circuit
+	// address, or, if the reservation lost the race, only this node's raw
+	// (often NAT'd, undialable) addresses -- is what gets sent below and
+	// stored in raft's persisted configuration permanently. Get that
+	// wrong and no amount of retrying a later read fixes it: the leader
+	// keeps trying to deliver AppendEntries to an address that was never
+	// reachable, until this node rejoins with a corrected one. Observed
+	// directly against a real relay this project's own deploy target
+	// (measured well under 1 Mbps to it): 15s was not consistently enough
+	// for the reservation handshake itself to complete over a link that
+	// slow, and every subsequent read from that follower failed
+	// indefinitely as a result -- not a timing issue a retry budget on
+	// the read side could ever paper over.
+	n.awaitRelayAddr(45 * time.Second)
 
 	maddr, err := multiaddr.NewMultiaddr(leaderAddr)
 	if err != nil {

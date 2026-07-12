@@ -16,5 +16,14 @@ export default defineConfig({
   },
   use: {
     baseURL: "http://localhost:5183",
+    // Plain "chromium" launches "Chromium Headless Shell" (a stripped-down
+    // binary) by default when headless. That variant doesn't forward
+    // wasm-originated console.log calls (web_sys::console::log_1) to CDP's
+    // Runtime.consoleAPICalled -- confirmed by a log_1 call at the very top
+    // of app.rs's send_event never appearing even for rows that provably
+    // executed it (their response came back). Plain JS console.log calls
+    // (e.g. vite's own client script) forward fine either way. The
+    // "chromium" channel forces the full Chrome-for-Testing binary instead.
+    channel: "chromium",
   },
 });

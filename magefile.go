@@ -317,14 +317,14 @@ func (E2E) Bootstrap() error {
 	if err != nil {
 		return err
 	}
-	multiaddr, peerID, err := e2erun.EnsureBootstrap(root, path, f)
+	multiaddr, webTransportAddr, peerID, err := e2erun.EnsureBootstrap(root, path, f)
 	if err != nil {
 		return err
 	}
 	if err := f.Save(path); err != nil {
 		return err
 	}
-	fmt.Printf("✅ bootstrap %s ready at %s\n", peerID, multiaddr)
+	fmt.Printf("✅ bootstrap %s ready at %s (webtransport: %s)\n", peerID, multiaddr, webTransportAddr)
 	return nil
 }
 
@@ -491,9 +491,33 @@ func BuildWindows() error {
 	return nil
 }
 
+// BuildAndroid cross-compiles mobile/kvmobile into android-app/app/libs/kvmobile.aar
+// via `gomobile bind`, with no identity/leader baked in -- a plain
+// "does this still compile for Android" smoke build, the Android
+// counterpart to BuildLinux/BuildWindows. `mage e2e:current`/`e2e:all`
+// build their own AAR with a real identity and leader multiaddr baked in
+// for actual test runs (see pkg/e2erun.buildAndroidAAR); this target
+// doesn't produce something a device can usefully run against a real
+// cluster.
 func BuildAndroid() error {
 	fmt.Println("Building Android AAR...")
-	// Implementation for gomobile bind...
+	root, err := repoRoot()
+	if err != nil {
+		return err
+	}
+	aarPath := filepath.Join(root, "android-app", "app", "libs", "kvmobile.aar")
+	if err := os.MkdirAll(filepath.Dir(aarPath), 0o755); err != nil {
+		return err
+	}
+	cmd := exec.Command("gomobile", "bind", "-target=android", "-androidapi", "26",
+		"-o", aarPath, "./mobile/kvmobile")
+	cmd.Dir = root
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("buildandroid: gomobile bind: %w", err)
+	}
+	fmt.Println("✅ android-app/app/libs/kvmobile.aar built (no identity/leader baked in)")
 	return nil
 }
 

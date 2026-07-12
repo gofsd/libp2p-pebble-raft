@@ -30,9 +30,9 @@ import (
 // tracker (autonatv2) correctly determines the follower's direct address is
 // in fact dialable -- it is, by every other node here -- so it never
 // surfaces a /p2p-circuit address in host.Addrs(), and awaitRelayAddr
-// reliably burns its full ~15s timeout waiting for one that will never
+// reliably burns its full ~45s timeout waiting for one that will never
 // appear. That is exactly the scenario the fix targets, just for a
-// different underlying reason than a real NATed deployment: a ~15s wait
+// different underlying reason than a real NATed deployment: a ~45s wait
 // now happens to elapse, for real, before join() ever opens the stream to
 // the leader. Before the fix (see the reordering this test would catch if
 // reverted: awaitRelayAddr moved back between NewStream and the request
@@ -40,8 +40,8 @@ import (
 // already open, blowing well past the leader's 10s multistream-select
 // negotiation timeout and getting the stream reset before the join request
 // ever reached it -- so the join would fail every time, not just under a
-// real relay-required deployment. Asserting a wall-clock floor near that
-// 15s window (see minJoinWait below) is what makes this test actually
+// real relay-required deployment. Asserting a wall-clock floor well into
+// that 45s window (see minJoinWait below) is what makes this test actually
 // exercise the fixed ordering rather than passing trivially fast.
 //
 // It asserts not just that the join RPC returns OK, but that it took long
@@ -109,11 +109,11 @@ func TestJoinThroughRelay(t *testing.T) {
 	}
 	defer follower.shutdown()
 
-	// minJoinWait is comfortably below awaitRelayAddr's own 15s ceiling (so
+	// minJoinWait is comfortably below awaitRelayAddr's own 45s ceiling (so
 	// a slightly-early return doesn't flake the test) but well past the
 	// leader's 10s multistream-select negotiation timeout -- the exact
 	// window the pre-fix ordering would have lost the race against.
-	const minJoinWait = 12 * time.Second
+	const minJoinWait = 40 * time.Second
 	joinStart := time.Now()
 	_, err = follower.handleAdd(ctx, leaderAddr)
 	joinElapsed := time.Since(joinStart)

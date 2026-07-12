@@ -1,8 +1,10 @@
 {
   "versions": {
-    "1": "0.0.0"
+    "1": "0.0.0",
+    "2": "0.0.0",
+    "3": "0.0.0"
   },
-  "published_version": 1,
+  "published_version": 3,
   "nodes": {
     "1": {
       "platform": "desktop",
@@ -15,6 +17,18 @@
       "peer_id": "12D3KooWPKG8Jfu2pjh8vRi8JW4CLzn7YpKVxmuyihu3o3vhE9nd",
       "public_key": "c88ef115a8b7c8c38c7aca36aea4cfeece8be72a5ee324d079ccac728d34cd9e",
       "private_key": "8292132027d7138303b0cde60e53e3dd1f8d67f6c724f0da26eded4601af6ac6c88ef115a8b7c8c38c7aca36aea4cfeece8be72a5ee324d079ccac728d34cd9e"
+    },
+    "3": {
+      "platform": "android",
+      "peer_id": "12D3KooWCZ1kzyffCh4UxVntx2bosMSWUqh3AidXffSTvypBXbvW",
+      "public_key": "28a4458d0e7d42c9b05478540dd25e39493b1a2b636de229abe970856a060d17",
+      "private_key": "5111a4f12b58c618b6509f1c39f58f68860ee743aaebf7459226b130d292092d28a4458d0e7d42c9b05478540dd25e39493b1a2b636de229abe970856a060d17"
+    },
+    "4": {
+      "platform": "web",
+      "peer_id": "12D3KooWDLdCrZfDYUpyx4kj3VaoeSDzTj6Y3KiUAAgPF1Qs4Vyr",
+      "public_key": "34537c9c1eb22b81f6dbef9427c3317a5a5d3a35411e3b94e0fc818bab64c4c9",
+      "private_key": "dcf503ece0117c7263ca81edfef2ec15f70fc4215cebef66a2df13b5640e0ba734537c9c1eb22b81f6dbef9427c3317a5a5d3a35411e3b94e0fc818bab64c4c9"
     }
   },
   "rows": [
@@ -62,6 +76,98 @@
       "event": {
         "event": "get_field",
         "value": "hello"
+      },
+      "status": 0
+    },
+    {
+      "version": 2,
+      "node": 3,
+      "event": {
+        "event": "add",
+        "value": "BOOTSTRAP"
+      },
+      "status": 0
+    },
+    {
+      "version": 2,
+      "node": 3,
+      "event": {
+        "event": "get_public_key"
+      },
+      "status": 0
+    },
+    {
+      "version": 2,
+      "node": 3,
+      "event": {
+        "event": "set_key",
+        "value": "hello-android",
+        "id": 200
+      },
+      "status": 0
+    },
+    {
+      "version": 2,
+      "node": 3,
+      "event": {
+        "event": "set_field",
+        "source_id": 200,
+        "value": "world-android"
+      },
+      "status": 0
+    },
+    {
+      "version": 2,
+      "node": 3,
+      "event": {
+        "event": "get_field",
+        "value": "hello-android"
+      },
+      "status": 0
+    },
+    {
+      "version": 3,
+      "node": 4,
+      "event": {
+        "event": "add",
+        "value": "BOOTSTRAP"
+      },
+      "status": 0
+    },
+    {
+      "version": 3,
+      "node": 4,
+      "event": {
+        "event": "get_public_key"
+      },
+      "status": 0
+    },
+    {
+      "version": 3,
+      "node": 4,
+      "event": {
+        "event": "set_key",
+        "value": "hello-web",
+        "id": 300
+      },
+      "status": 0
+    },
+    {
+      "version": 3,
+      "node": 4,
+      "event": {
+        "event": "set_field",
+        "source_id": 300,
+        "value": "world-web"
+      },
+      "status": 0
+    },
+    {
+      "version": 3,
+      "node": 4,
+      "event": {
+        "event": "get_field",
+        "value": "hello-web"
       },
       "status": 0
     }

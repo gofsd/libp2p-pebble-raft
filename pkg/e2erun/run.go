@@ -30,28 +30,53 @@ import (
 // failing; the caller should still treat f/path as having the real,
 // saved results even when this returns an error.
 func Run(repoRoot, path string, f *e2edata.File, rowIndices []int) error {
-	bootstrapMultiaddr, bootstrapPeerID, err := EnsureBootstrap(repoRoot, path, f)
+	bootstrapMultiaddr, bootstrapWebTransportAddr, bootstrapPeerID, err := EnsureBootstrap(repoRoot, path, f)
 	if err != nil {
 		return fmt.Errorf("e2erun: ensure bootstrap: %w", err)
 	}
-	fmt.Fprintf(os.Stderr, "e2erun: bootstrap %s ready at %s\n", bootstrapPeerID, bootstrapMultiaddr)
+	fmt.Fprintf(os.Stderr, "e2erun: bootstrap %s ready at %s (webtransport: %s)\n", bootstrapPeerID, bootstrapMultiaddr, bootstrapWebTransportAddr)
 
 	kvnodeBin, kvctlBin, err := buildNativeBinaries(repoRoot)
 	if err != nil {
 		return err
 	}
 
-	web := &webRunResult{}
+	// Android and web rows each run as one batch per node -- a real
+	// gomobile bind + gradle install + instrumented test run per android
+	// node (see runAndroidRows's doc comment), and a real Playwright run
+	// per web node with that node's own recorded identity baked in (see
+	// runWebRows's doc comment) -- rather than per-row like desktop/remote,
+	// since rebuilding/reinstalling/relaunching a browser per row would be
+	// prohibitively slow. Both are resolved up front here instead of
+	// through runRow's per-row dispatch.
+	androidResults := runAndroidRows(repoRoot, f, rowIndices, bootstrapMultiaddr)
+	webResults := runWebRows(repoRoot, f, rowIndices, bootstrapWebTransportAddr)
+
 	failures := 0
 	for _, idx := range rowIndices {
 		row := &f.Rows[idx]
 		node, ok := f.Nodes[row.Node]
-		if !ok {
+		switch {
+		case !ok:
 			row.Status = e2edata.StatusFail
 			row.Error = fmt.Sprintf("unknown node id %d", row.Node)
 			failures++
-		} else {
-			status, errMsg := runRow(repoRoot, kvnodeBin, kvctlBin, row.Node, node, bootstrapMultiaddr, row.Event, web)
+		case node.Platform == e2edata.PlatformAndroid:
+			outcome := androidResults[idx]
+			row.Status = outcome.status
+			row.Error = outcome.errMsg
+			if outcome.status == e2edata.StatusFail {
+				failures++
+			}
+		case node.Platform == e2edata.PlatformWeb:
+			outcome := webResults[idx]
+			row.Status = outcome.status
+			row.Error = outcome.errMsg
+			if outcome.status == e2edata.StatusFail {
+				failures++
+			}
+		default:
+			status, errMsg := runRow(kvnodeBin, kvctlBin, row.Node, node, bootstrapMultiaddr, row.Event)
 			row.Status = status
 			row.Error = errMsg
 			if status == e2edata.StatusFail {
@@ -84,10 +109,11 @@ func statusName(status int) string {
 
 // runRow dispatches one row to the right execution path: a PlatformRemote
 // node goes over ssh; PlatformDesktop identities get a real local kvnode
-// process and a real sendevent call; web rows share one Playwright-driven
-// verdict per Run; android rows are always reported skipped (see
-// web.go/runWebSuite and this package's doc comment for the reasoning).
-func runRow(repoRoot, kvnodeBin, kvctlBin string, nodeID int, node e2edata.Node, bootstrapMultiaddr string, ev e2edata.Event, web *webRunResult) (status int, errMsg string) {
+// process and a real sendevent call. PlatformAndroid/PlatformWeb rows never
+// reach here -- Run resolves them as a batch via runAndroidRows/runWebRows
+// before this per-row loop even starts (see those functions' doc comments
+// for why).
+func runRow(kvnodeBin, kvctlBin string, nodeID int, node e2edata.Node, bootstrapMultiaddr string, ev e2edata.Event) (status int, errMsg string) {
 	if ev.EventType == shmevent.EventAdd {
 		resolved := ResolveBootstrapPlaceholder(string(ev.Value()), bootstrapMultiaddr)
 		ev = e2edata.NewEvent(ev.EventType, ev.SourceID, ev.DestinationID, []byte(resolved), ev.ID)
@@ -101,13 +127,58 @@ func runRow(repoRoot, kvnodeBin, kvctlBin string, nodeID int, node e2edata.Node,
 			return e2edata.StatusFail, err.Error()
 		}
 		return retryReadsIfNeeded(ev, func() (int, string) { return sendEventLocal(kvctlBin, node.PeerID, ev) })
-	case e2edata.PlatformWeb:
-		return web.resultFor(repoRoot, bootstrapMultiaddr)
-	case e2edata.PlatformAndroid:
-		return e2edata.StatusSkipped, "android e2e execution not implemented yet -- no on-device/emulator build automation exists; see mobile/kvmobile"
 	default:
 		return e2edata.StatusFail, fmt.Sprintf("unknown platform %q", node.Platform)
 	}
+}
+
+// rowOutcome is a row's (status, error) pair -- the same shape
+// e2edata.Row.Status/Error records, factored out so the android/web batch
+// runners can return a batch of them keyed by row index.
+type rowOutcome struct {
+	status int
+	errMsg string
+}
+
+// platformRowResult is the shape both E2ETest.kt (Android) and
+// tests/e2e.spec.js (web) write their per-row results file as.
+type platformRowResult struct {
+	Index int    `json:"index"`
+	Pass  bool   `json:"pass"`
+	Error string `json:"error"`
+}
+
+// parseRowResults maps a platform driver's results JSON (indices into the
+// per-node event list the caller built) back to rowIdxs (indices into
+// f.Rows), filling in a failure for any row the driver never reported --
+// e.g. because a row after it crashed the whole process. driverName is
+// folded into that fallback message only.
+func parseRowResults(resultsJSON []byte, rowIdxs []int, driverName string) (map[int]rowOutcome, error) {
+	var parsed []platformRowResult
+	if err := json.Unmarshal(resultsJSON, &parsed); err != nil {
+		return nil, fmt.Errorf("e2erun: parse %s results: %w (raw: %s)", driverName, err, resultsJSON)
+	}
+
+	out := make(map[int]rowOutcome, len(rowIdxs))
+	seen := make(map[int]bool, len(rowIdxs))
+	for _, r := range parsed {
+		if r.Index < 0 || r.Index >= len(rowIdxs) {
+			continue
+		}
+		idx := rowIdxs[r.Index]
+		seen[idx] = true
+		if r.Pass {
+			out[idx] = rowOutcome{status: e2edata.StatusPass}
+		} else {
+			out[idx] = rowOutcome{status: e2edata.StatusFail, errMsg: r.Error}
+		}
+	}
+	for _, idx := range rowIdxs {
+		if !seen[idx] {
+			out[idx] = rowOutcome{status: e2edata.StatusFail, errMsg: driverName + " reported no result for this row"}
+		}
+	}
+	return out, nil
 }
 
 // readRetryAttempts/readRetryDelay bound retryReadsIfNeeded's total wait to

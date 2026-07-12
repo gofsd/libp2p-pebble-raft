@@ -31,12 +31,23 @@
 #![cfg(target_arch = "wasm32")]
 
 use futures::channel::{mpsc, oneshot};
-use futures::{AsyncReadExt, AsyncWriteExt, SinkExt, StreamExt};
+use futures::{AsyncReadExt, AsyncWriteExt, FutureExt, SinkExt, StreamExt};
 use libp2p::{
     identity::Keypair, noise, relay, swarm::NetworkBehaviour, webtransport_websys, Multiaddr,
     PeerId, StreamProtocol, Swarm, SwarmBuilder,
 };
 use libp2p_stream as stream;
+use wasm_bindgen::prelude::wasm_bindgen;
+
+#[wasm_bindgen]
+extern "C" {
+    // See worker.js's __debugLog doc comment: this code runs inside the
+    // Worker, whose console messages Playwright's page.on("console") never
+    // sees, so diagnostics here go through this relay instead of
+    // web_sys::console::log_1.
+    #[wasm_bindgen(js_namespace = globalThis, js_name = __debugLog)]
+    pub(crate) fn debug_log(msg: &str);
+}
 
 use crate::raft_wire;
 
@@ -44,6 +55,23 @@ use crate::raft_wire;
 pub const RAFT_PROTOCOL: StreamProtocol = StreamProtocol::new("/libp2p-kv-raft/raft/1.0.0");
 /// Matches `pkg/daemon.ClientProtocolID` exactly.
 pub const CLIENT_PROTOCOL: StreamProtocol = StreamProtocol::new("/libp2p-kv-raft/client/1.0.0");
+
+/// Bounds [`Node::do_reserve`]'s whole dial-then-reserve flow: neither of
+/// its two swarm-event-waiting loops has any timeout of its own, so a
+/// reservation that never completes (the relay target dials fine but the
+/// v2 reservation handshake itself stalls -- observed directly against
+/// this project's own real deploy target, whose link can be well under
+/// 1 Mbps) hangs [`Handle::reserve_relay_slot`] forever with no way for a
+/// caller to notice, let alone recover. Mirrors
+/// `pkg/daemon.join`'s `awaitRelayAddr(45 * time.Second)` fix for the
+/// exact same failure mode on the Go side -- same 45s budget, same
+/// reasoning: a slow reservation isn't a bug, an *unbounded* wait for one
+/// is.
+const RELAY_RESERVATION_TIMEOUT_MS: u32 = 45_000;
+
+/// Bounds each [`Handle::call_client_protocol`] round trip -- see that
+/// method's doc comment for why it needs one at all.
+const CLIENT_PROTOCOL_TIMEOUT_MS: u32 = 45_000;
 
 #[derive(NetworkBehaviour)]
 struct Behaviour {
@@ -156,7 +184,15 @@ impl Node {
                 cmd = self.commands.next() => {
                     match cmd {
                         Some(Command::ReserveRelaySlot(addr, reply)) => {
-                            let result = self.do_reserve(addr).await;
+                            let result = futures::select! {
+                                result = self.do_reserve(addr).fuse() => result,
+                                _ = gloo_timers::future::TimeoutFuture::new(RELAY_RESERVATION_TIMEOUT_MS).fuse() => {
+                                    Err(Error(format!(
+                                        "relay reservation timed out after {}s -- the reservation handshake itself never completed, most likely a slow/unreachable path to the relay target rather than a bug here (see RELAY_RESERVATION_TIMEOUT_MS's doc comment)",
+                                        RELAY_RESERVATION_TIMEOUT_MS / 1000
+                                    )))
+                                }
+                            };
                             let _ = reply.send(result);
                         }
                         None => {}
@@ -167,12 +203,14 @@ impl Node {
     }
 
     async fn do_reserve(&mut self, addr: Multiaddr) -> Result<Multiaddr, Error> {
+        debug_log(&format!("kv-raft-web: do_reserve: dialing {addr}"));
         self.swarm
             .dial(addr.clone())
             .map_err(|e| Error(e.to_string()))?;
 
         let relay_peer = loop {
-            match self.swarm.select_next_some().await {
+            let event = self.swarm.select_next_some().await;
+            match event {
                 libp2p::swarm::SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                     break peer_id;
                 }
@@ -182,20 +220,42 @@ impl Node {
                 _ => {}
             }
         };
+        debug_log(&format!("kv-raft-web: do_reserve: connected to relay {relay_peer}"));
 
-        let circuit_addr: Multiaddr = format!("/p2p/{relay_peer}/p2p-circuit").parse()?;
+        // Must carry the relay's actual dialable address, not just its bare
+        // peer id (`/p2p/<relay_peer>/p2p-circuit` alone) -- the relay
+        // client transport needs the full path to know which relay to
+        // reserve a slot through, and rejects a bare-peer-id circuit
+        // address with `MissingRelayAddr` (confirmed directly: this is
+        // exactly the error `listen_on` returned before this fix). `addr`
+        // is the full target multiaddr `do_connect` was given, already
+        // ending in `/p2p/<relay_peer>`, so appending `/p2p-circuit`
+        // directly onto it is both correct and simpler than rebuilding an
+        // address from scratch.
+        let circuit_addr: Multiaddr = addr.with(libp2p::multiaddr::Protocol::P2pCircuit);
         self.swarm
             .listen_on(circuit_addr.clone())
-            .map_err(|e| Error(e.to_string()))?;
+            .map_err(|e| Error(format!("listen_on circuit addr: {e:?}")))?;
+        debug_log(&format!("kv-raft-web: do_reserve: listen_on({circuit_addr}) called"));
 
         loop {
-            match self.swarm.select_next_some().await {
+            let event = self.swarm.select_next_some().await;
+            match event {
                 libp2p::swarm::SwarmEvent::NewListenAddr { address, .. }
                     if address.to_string().contains("p2p-circuit") =>
                 {
-                    return Ok(address.with(libp2p::multiaddr::Protocol::P2p(
-                        *self.swarm.local_peer_id(),
-                    )));
+                    // `address` already ends in `/p2p/<local_peer_id>` --
+                    // the relay client behaviour reports circuit listen
+                    // addresses fully qualified with the local peer id, not
+                    // just the relay's. Appending it again here used to
+                    // produce a malformed, doubled-up address
+                    // (`.../p2p-circuit/p2p/<id>/p2p/<id>`) that this tab
+                    // sent the leader as its own dial-back address for
+                    // AppendEntries -- confirmed directly: the join/set
+                    // calls all succeeded, but the leader could never push
+                    // any raft entries back, so a local Get right after a
+                    // remote Set always came up empty.
+                    return Ok(address);
                 }
                 libp2p::swarm::SwarmEvent::ListenerError { error, .. } => {
                     return Err(Error(format!("relay reservation: {error}")));
@@ -234,14 +294,17 @@ impl Handle {
             .control
             .accept(RAFT_PROTOCOL)
             .map_err(|e| Error(e.to_string()))?;
-        while let Some((_peer, stream)) = incoming.next().await {
+        debug_log("kv-raft-web: serve_raft: accepting inbound raft streams");
+        while let Some((peer, stream)) = incoming.next().await {
+            debug_log(&format!("kv-raft-web: serve_raft: inbound stream from {peer}"));
             let learner = learner.clone();
             wasm_bindgen_futures::spawn_local(async move {
                 if let Err(e) = serve_raft_stream(stream, learner).await {
-                    web_sys::console::log_1(&format!("kv-raft-web: raft stream: {e}").into());
+                    debug_log(&format!("kv-raft-web: raft stream: {e}"));
                 }
             });
         }
+        debug_log("kv-raft-web: serve_raft: incoming stream iterator ended");
         Ok(())
     }
 
@@ -253,23 +316,55 @@ impl Handle {
     /// message has no fixed size (unlike the ipcproto.Request/Response
     /// this replaced), so the response is read until the daemon closes
     /// its write side rather than a known byte count.
+    ///
+    /// Bounded by [`CLIENT_PROTOCOL_TIMEOUT_MS`]: neither `open_stream` nor
+    /// `read_to_end` below has any timeout of its own, so a stream that
+    /// never opens (e.g. dialing back through a relay circuit that looked
+    /// reserved but isn't actually usable yet) or a remote that never
+    /// closes its write side hangs this -- and every caller through
+    /// `do_connect`/`do_set`/`fetch_remote_signing_key` -- forever, the
+    /// same failure mode [`RELAY_RESERVATION_TIMEOUT_MS`] fixes for the
+    /// reservation step itself. Caught by exactly that happening against a
+    /// real relay-mediated leader: the reservation completed but a
+    /// following `call_client_protocol` still hung the full test timeout.
     pub async fn call_client_protocol(
         &mut self,
         target: PeerId,
         req: &crate::shmevent::Msg,
         priv_key: Option<&ed25519_dalek::SigningKey>,
     ) -> Result<crate::shmevent::Msg, Error> {
+        futures::select! {
+            result = self.call_client_protocol_inner(target, req, priv_key).fuse() => result,
+            _ = gloo_timers::future::TimeoutFuture::new(CLIENT_PROTOCOL_TIMEOUT_MS).fuse() => {
+                Err(Error(format!(
+                    "client protocol call timed out after {}s",
+                    CLIENT_PROTOCOL_TIMEOUT_MS / 1000
+                )))
+            }
+        }
+    }
+
+    async fn call_client_protocol_inner(
+        &mut self,
+        target: PeerId,
+        req: &crate::shmevent::Msg,
+        priv_key: Option<&ed25519_dalek::SigningKey>,
+    ) -> Result<crate::shmevent::Msg, Error> {
+        debug_log(&format!("kv-raft-web: call_client_protocol: opening stream to {target}"));
         let mut s = self
             .control
             .open_stream(target, CLIENT_PROTOCOL.clone())
             .await
             .map_err(|e| Error(e.to_string()))?;
+        debug_log("kv-raft-web: call_client_protocol: stream open, writing request");
         let buf = crate::shmevent::encode(req, priv_key).map_err(|e| Error(e.to_string()))?;
         s.write_all(&buf).await?;
         s.close().await?;
+        debug_log("kv-raft-web: call_client_protocol: request written, reading response");
 
         let mut resp_buf = Vec::new();
         s.read_to_end(&mut resp_buf).await?;
+        debug_log(&format!("kv-raft-web: call_client_protocol: got {} response bytes", resp_buf.len()));
         let (resp, _, _) = crate::shmevent::decode(&resp_buf).map_err(|e| Error(e.to_string()))?;
         Ok(resp)
     }
@@ -292,6 +387,7 @@ async fn serve_raft_stream(
         }
         let rpc_type = raft_wire::RpcType::from_byte(type_byte[0])
             .ok_or_else(|| Error(format!("unknown rpc type {}", type_byte[0])))?;
+        debug_log(&format!("kv-raft-web: serve_raft_stream: rpc {rpc_type:?}"));
 
         // Every request struct decodes from one msgpack value with no
         // length prefix, so read incrementally: grow a buffer and retry
@@ -300,37 +396,64 @@ async fn serve_raft_stream(
         // worth of bytes off the wire without a separate framing layer.
         let reply_bytes = match rpc_type {
             raft_wire::RpcType::AppendEntries => {
-                let req = decode_one(&mut s, raft_wire::decode_append_entries_request).await?;
+                let (req, _leftover) =
+                    decode_one(&mut s, raft_wire::decode_append_entries_request).await?;
                 let resp = learner
                     .handle_append_entries(&req)
                     .map_err(|e| Error(e.to_string()))?;
                 raft_wire::encode_reply(None, &raft_wire::encode_append_entries_response(&resp))
             }
             raft_wire::RpcType::RequestVote => {
-                let req = decode_one(&mut s, raft_wire::decode_request_vote_request).await?;
+                let (req, _leftover) =
+                    decode_one(&mut s, raft_wire::decode_request_vote_request).await?;
                 let resp = learner
                     .handle_request_vote(&req)
                     .map_err(|e| Error(e.to_string()))?;
                 raft_wire::encode_reply(None, &raft_wire::encode_request_vote_response(&resp))
             }
             raft_wire::RpcType::RequestPreVote => {
-                let req = decode_one(&mut s, raft_wire::decode_request_pre_vote_request).await?;
+                let (req, _leftover) =
+                    decode_one(&mut s, raft_wire::decode_request_pre_vote_request).await?;
                 let resp = learner
                     .handle_request_pre_vote(&req)
                     .map_err(|e| Error(e.to_string()))?;
                 raft_wire::encode_reply(None, &raft_wire::encode_request_pre_vote_response(&resp))
             }
             raft_wire::RpcType::InstallSnapshot => {
-                let req = decode_one(&mut s, raft_wire::decode_install_snapshot_request).await?;
-                let mut body = vec![0u8; req.size.max(0) as usize];
-                s.read_exact(&mut body).await?;
+                let (req, leftover) =
+                    decode_one(&mut s, raft_wire::decode_install_snapshot_request).await?;
+                // The raw snapshot body immediately follows the msgpack
+                // header on the same stream (hashicorp/raft's
+                // NetworkTransport.InstallSnapshot writes both to the same
+                // buffered writer before one flush -- see net_transport.go),
+                // so a single underlying read can legitimately return header
+                // bytes *and* some/all of the body bytes together. decode_one
+                // already consumed that whole chunk into its own buffer to
+                // find the header; `leftover` is whatever of it came after
+                // the header ended, per its own doc comment. Without
+                // prepending it here, those bytes were silently discarded and
+                // the subsequent read_exact came up short -- confirmed
+                // directly: every InstallSnapshot attempt failed with
+                // "unexpected end of file" until this fix, which is why this
+                // RPC type was the only one actually broken by the bug (every
+                // other RPC here has nothing following its own header on the
+                // wire, so the same silent discard was always harmless there).
+                let want = req.size.max(0) as usize;
+                let mut body = leftover;
+                body.truncate(want); // leftover can't legitimately exceed the announced size
+                if body.len() < want {
+                    let mut rest = vec![0u8; want - body.len()];
+                    s.read_exact(&mut rest).await?;
+                    body.extend_from_slice(&rest);
+                }
                 let resp = learner
                     .handle_install_snapshot(&req, &body)
                     .map_err(|e| Error(e.to_string()))?;
                 raft_wire::encode_reply(None, &raft_wire::encode_install_snapshot_response(&resp))
             }
             raft_wire::RpcType::TimeoutNow => {
-                let req = decode_one(&mut s, raft_wire::decode_timeout_now_request).await?;
+                let (req, _leftover) =
+                    decode_one(&mut s, raft_wire::decode_timeout_now_request).await?;
                 let resp = learner
                     .handle_timeout_now(&req)
                     .map_err(|e| Error(e.to_string()))?;
@@ -346,16 +469,30 @@ async fn serve_raft_stream(
 /// on truncation. `AppendEntriesRequest`'s `Entries` can be arbitrarily
 /// large, so there is no fixed size to read up front the way
 /// `ipcproto`/`raft_wire`'s own fixed-size reply framing allows.
+///
+/// Returns any bytes read past the end of the decoded value alongside it,
+/// rather than discarding them: a single `s.read()` has no reason to stop
+/// exactly at a msgpack value's boundary, so a chunk can come back carrying
+/// the start of whatever follows on the wire too. Every RPC here except
+/// `InstallSnapshot` has nothing following its own header on the same
+/// stream, so an empty leftover is the normal case for those -- but
+/// `InstallSnapshot`'s raw snapshot body comes right after its header (see
+/// that match arm's doc comment), and discarding a chunk's leftover bytes
+/// used to silently drop the start of that body, always coming up short on
+/// the subsequent fixed-size read.
 async fn decode_one<T>(
     s: &mut libp2p::Stream,
     decode: impl Fn(&mut crate::msgpack::Reader) -> crate::msgpack::Result<T>,
-) -> Result<T, Error> {
+) -> Result<(T, Vec<u8>), Error> {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
     loop {
         let mut r = crate::msgpack::Reader::new(&buf);
         match decode(&mut r) {
-            Ok(v) => return Ok(v),
+            Ok(v) => {
+                let consumed = r.pos();
+                return Ok((v, buf[consumed..].to_vec()));
+            }
             Err(crate::msgpack::Error::UnexpectedEof) => {
                 let n = s.read(&mut chunk).await.map_err(|e| Error(e.to_string()))?;
                 if n == 0 {

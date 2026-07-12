@@ -23,6 +23,9 @@ func main() {
 	electionTimeout := flag.Duration("raft-election-timeout", 0, "raft election timeout (0 = default, 1s)")
 	commitTimeout := flag.Duration("raft-commit-timeout", 0, "raft commit timeout (0 = default, 50ms)")
 	leaderLeaseTimeout := flag.Duration("raft-leader-lease-timeout", 0, "raft leader lease timeout (0 = default, 500ms)")
+	snapshotThreshold := flag.Uint64("raft-snapshot-threshold", 0, "raft log entries since last snapshot before a new one is taken (0 = hashicorp/raft's own default, 8192 -- large for a long-lived leader that new non-voters periodically join, since a join replays the whole log from index 1 up to the last snapshot)")
+	snapshotInterval := flag.Duration("raft-snapshot-interval", 0, "how often raft checks whether a snapshot is due (0 = default, 120s)")
+	trailingLogs := flag.Uint64("raft-trailing-logs", 0, "log entries a snapshot keeps instead of compacting away (0 = hashicorp/raft's own default, 10240 -- set this alongside -raft-snapshot-threshold, not instead of it: a log smaller than this has nothing eligible for compaction regardless of how often it snapshots)")
 	flag.Parse()
 
 	if *dataDir == "" || *keyPath == "" {
@@ -47,6 +50,9 @@ func main() {
 		ElectionTimeout:    *electionTimeout,
 		CommitTimeout:      *commitTimeout,
 		LeaderLeaseTimeout: *leaderLeaseTimeout,
+		SnapshotThreshold:  *snapshotThreshold,
+		SnapshotInterval:   *snapshotInterval,
+		TrailingLogs:       *trailingLogs,
 	})
 	if err != nil && ctx.Err() == nil {
 		fmt.Fprintf(os.Stderr, "kvnode: %v\n", err)

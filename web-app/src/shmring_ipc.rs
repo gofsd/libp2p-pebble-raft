@@ -212,26 +212,35 @@ where
         let handle = handle.clone();
         let global = global_for_post.clone();
         let Ok(req_sab) = e.data().dyn_into::<SharedArrayBuffer>() else {
+            // Not this transport's message -- e.g. shmevent's own
+            // {__debug}/{__ready} relay messages (see worker.js's doc
+            // comment) also arrive on this same Worker, deliberately
+            // ignored here since they're not a SharedArrayBuffer handoff.
             return;
         };
         wasm_bindgen_futures::spawn_local(async move {
             let Ok(mut reader) = open_reader(req_sab) else {
+                crate::p2p::debug_log("kv-raft-web: shmring_ipc::serve: open_reader failed");
                 return;
             };
             let Ok(req_buf) = poll_read_to_end(&mut reader).await else {
+                crate::p2p::debug_log("kv-raft-web: shmring_ipc::serve: poll_read_to_end failed");
                 return;
             };
             let _ = reader.close();
 
             let Ok((req, crc, sig)) = shmevent::decode(&req_buf) else {
+                crate::p2p::debug_log("kv-raft-web: shmring_ipc::serve: decode failed");
                 return;
             };
             let resp_buf = handle(req, crc, sig).await;
 
             let Ok((mut writer, resp_sab)) = new_writer() else {
+                crate::p2p::debug_log("kv-raft-web: shmring_ipc::serve: new_writer failed");
                 return;
             };
             if poll_write_all(&mut writer, &resp_buf).await.is_err() {
+                crate::p2p::debug_log("kv-raft-web: shmring_ipc::serve: poll_write_all failed");
                 return;
             }
             let _ = writer.close();

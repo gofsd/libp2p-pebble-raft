@@ -69,6 +69,51 @@ func TestStatusName(t *testing.T) {
 	}
 }
 
+func TestParseRowResults(t *testing.T) {
+	rowIdxs := []int{10, 20, 30}
+
+	out, err := parseRowResults([]byte(`[
+		{"index":0,"pass":true},
+		{"index":1,"pass":false,"error":"store: key not found"},
+		{"index":2,"pass":true}
+	]`), rowIdxs, "test driver")
+	if err != nil {
+		t.Fatalf("parseRowResults: %v", err)
+	}
+	if out[10].status != e2edata.StatusPass {
+		t.Fatalf("row 10 (index 0) = %+v, want pass", out[10])
+	}
+	if out[20].status != e2edata.StatusFail || out[20].errMsg != "store: key not found" {
+		t.Fatalf("row 20 (index 1) = %+v, want fail with the recorded error", out[20])
+	}
+	if out[30].status != e2edata.StatusPass {
+		t.Fatalf("row 30 (index 2) = %+v, want pass", out[30])
+	}
+}
+
+func TestParseRowResultsMissingRowFailsClosed(t *testing.T) {
+	rowIdxs := []int{10, 20}
+
+	// Only one of the two expected results came back -- e.g. the driver
+	// process crashed partway through.
+	out, err := parseRowResults([]byte(`[{"index":0,"pass":true}]`), rowIdxs, "test driver")
+	if err != nil {
+		t.Fatalf("parseRowResults: %v", err)
+	}
+	if out[10].status != e2edata.StatusPass {
+		t.Fatalf("row 10 = %+v, want pass", out[10])
+	}
+	if out[20].status != e2edata.StatusFail {
+		t.Fatalf("row 20 (never reported) = %+v, want fail-closed, not a silent pass", out[20])
+	}
+}
+
+func TestParseRowResultsInvalidJSON(t *testing.T) {
+	if _, err := parseRowResults([]byte("not json"), []int{1}, "test driver"); err == nil {
+		t.Fatal("parseRowResults with invalid JSON: want error, got nil")
+	}
+}
+
 func mustJSON(t *testing.T, ev e2edata.Event) string {
 	t.Helper()
 	data, err := json.Marshal(ev)

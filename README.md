@@ -99,7 +99,7 @@ gomobile bind -target=android -androidapi 26 \
   -ldflags "-X github.com/gofsd/libp2p-kv-raft/mobile/kvmobile.leaderMultiaddr=$LEADER_ADDR" \
   -o android-app/app/libs/kvmobile.aar ./mobile/kvmobile
 
-cd android-app && gradle assembleDebug   # no wrapper checked in; use a local gradle install
+cd android-app && ./gradlew assembleDebug
 adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
 
@@ -112,7 +112,10 @@ The app's UI (`MainActivity`) is a thin wrapper over `Kvmobile.start/submit/get`
 up the daemon and joins the cluster, `submit`/`get` go through the daemon's IPC exactly like the
 desktop CLI, just over the Android shared-memory transport instead of named shared memory. Every
 `submit` is forwarded from this (never-leader) follower to whichever peer is currently leader,
-over `pkg/daemon.ForwardProtocolID`.
+over `pkg/daemon.ForwardProtocolID`. `Kvmobile.sendEvent` (not used by `MainActivity`, only by the
+e2e pipeline's `E2ETest` instrumented test) exposes the same raw `pkg/shmevent` event dispatch
+`submit`/`get` are themselves built on, for tests that need the exact event kvctl-cli's `sendevent`
+can send on desktop/remote rather than only the higher-level Set/Get shape.
 
 **MIUI/Xiaomi devices**: `adb install` can fail with `INSTALL_FAILED_USER_RESTRICTED` even with
 "Unknown sources" allowed — there's a separate Developer Options toggle, **"Install via USB"**,
@@ -197,9 +200,19 @@ test rows -- each one raw `pkg/shmevent.Msg` sent to a node, printed with a huma
 name and a plain-text value rather than the wire bytes (see `pkg/e2edata.Event`'s doc comment for
 exactly how, without changing the underlying capnp structure at all) -- with the last run's
 pass/fail status and error message. See `pkg/e2edata` for the file format and `pkg/e2erun` for what
-running a row actually does per platform (a real locally-spawned `kvnode` for desktop, the SSH
-bootstrap leader itself for remote, a real Playwright-driven browser check for web, and -- since no
-on-device/emulator build automation exists yet -- a clearly marked skip for android).
+running a row actually does per platform: a real locally-spawned `kvnode` for desktop, the SSH
+bootstrap leader itself for remote, a real Playwright-driven browser check for web, and for android
+a real `gomobile bind` (baking that row's node identity and the live bootstrap address into the
+AAR, via the same `kvmobile.SendEvent` raw-event entry point kvctl-cli's `sendevent` exposes on
+desktop/remote) + `./gradlew installDebug installDebugAndroidTest` + `adb shell am instrument`
+against whatever device/emulator is connected, pulling back a real per-row results file (see
+`android-app/app/src/androidTest/.../E2ETest.kt`) -- degrading to a clear Skipped status if
+`gomobile`/`adb`/a connected device aren't available at all, and a clear Failed status with the
+real diagnostic (not just "exit status 1") if the build/install/instrument step itself fails --
+e.g. the exact `INSTALL_FAILED_USER_RESTRICTED` MIUI/Xiaomi restriction noted under [Follower on
+Android](#follower-on-android) blocks the *instrumented test* APK's install the same way it can
+block a plain `adb install`, needing that same device-side "Install via USB" toggle enabled before
+`e2e:current`/`e2e:all` can drive that node for real.
 
 ```bash
 mage e2e:newversion                                                     # stamp a new version with the current semver

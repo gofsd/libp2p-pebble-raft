@@ -107,7 +107,7 @@ pub async fn worker_main() {
 /// instead of silently hanging.
 #[wasm_bindgen]
 pub async fn worker_main_with_seed(seed_hex: String) -> Result<(), JsValue> {
-    let raw = hex_decode(&seed_hex)
+    let raw = shmevent::hex_decode(&seed_hex)
         .map_err(|e| JsValue::from_str(&format!("worker_main_with_seed: decode seed_hex: {e}")))?;
     if raw.len() != 64 {
         return Err(JsValue::from_str(&format!(
@@ -174,25 +174,6 @@ async fn run_worker(keypair: identity::Keypair) {
     });
 }
 
-/// Minimal hex decoder so `worker_main_with_seed` doesn't need to pull in
-/// a whole `hex` crate dependency for one call site.
-fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
-    if s.len() % 2 != 0 {
-        return Err("odd-length hex string".to_string());
-    }
-    let mut out = Vec::with_capacity(s.len() / 2);
-    let bytes = s.as_bytes();
-    for chunk in bytes.chunks(2) {
-        let hi = (chunk[0] as char)
-            .to_digit(16)
-            .ok_or_else(|| format!("invalid hex digit {:?}", chunk[0] as char))?;
-        let lo = (chunk[1] as char)
-            .to_digit(16)
-            .ok_or_else(|| format!("invalid hex digit {:?}", chunk[1] as char))?;
-        out.push(((hi << 4) | lo) as u8);
-    }
-    Ok(out)
-}
 
 /// Dispatches one decoded main-thread request the same way
 /// `pkg/daemon.handleShmEvent` dispatches a local `pkg/ipc` request --
@@ -374,10 +355,15 @@ async fn do_connect(
         .ok_or_else(|| p2p::Error("multiaddr missing /p2p/<peer-id>".into()))?;
 
     let mut handle = state.borrow().handle.clone();
+    crate::p2p::debug_log("kv-raft-web: do_connect: reserving relay slot");
     let self_addr = handle.reserve_relay_slot(addr).await?;
     let self_id = handle.local_peer_id();
+    crate::p2p::debug_log(&format!(
+        "kv-raft-web: do_connect: relay slot reserved, self_addr={self_addr}"
+    ));
 
     let remote_priv = fetch_remote_signing_key(&mut handle, target_peer).await?;
+    crate::p2p::debug_log("kv-raft-web: do_connect: fetched remote signing key");
 
     let store = SqliteStore::open(&format!("kv-raft-web-{self_id}.sqlite3"), None)
         .map_err(|e| p2p::Error(e.to_string()))?;
@@ -538,17 +524,46 @@ async fn do_set(
 /// through its own `commit_index`) -- may lag a moment behind a Set that
 /// just committed on the leader, same caveat any raft follower's local
 /// read already carries. Purely local: no round trip to the leader at all.
+///
+/// Retries for up to `GET_RETRY_BUDGET_MS`. The e2e pipeline's deploy
+/// target is a single long-lived VPS leader that is deliberately never
+/// torn down between runs (so a human can keep poking at it -- see
+/// `test/e2e/testdata.json`'s doc comment), so its raft log keeps growing
+/// across every past `mage e2e:all` invocation ever run against it. A tab
+/// that just joined (see `do_connect`) starts catching up from index 1, not
+/// from wherever the log happens to be "recent" -- confirmed directly:
+/// after joining against a leader whose log was already past index 1400,
+/// this tab received well over a thousand individual `AppendEntries`
+/// (mostly old no-op/heartbeat entries) before ever reaching the one
+/// actually containing the Set this row just made. Android/desktop's own
+/// equivalent rows join the exact same shared leader and are just as
+/// exposed to this in principle, but never hit it in practice: their build/
+/// install/ADB round trips before a row even runs are already far longer
+/// than the catch-up takes. This budget will need to grow as the shared
+/// leader's log keeps accumulating, until raft's own snapshotting kicks in
+/// and collapses a fresh join back down to one `InstallSnapshot` again.
 async fn do_get(state: &Rc<RefCell<WorkerState>>, key: &str) -> Result<String, p2p::Error> {
+    const GET_RETRY_BUDGET_MS: u32 = 30_000;
+    const GET_RETRY_INTERVAL_MS: u32 = 100;
+
     let learner = state
         .borrow()
         .learner
         .clone()
         .ok_or_else(|| p2p::Error("do_connect has not completed yet".into()))?;
-    let value = learner
-        .get(key.as_bytes())
-        .map_err(|e| p2p::Error(e.to_string()))?
-        .ok_or_else(|| p2p::Error(format!("key {key:?} not found")))?;
-    String::from_utf8(value).map_err(|e| p2p::Error(e.to_string()))
+
+    let mut waited_ms = 0;
+    loop {
+        let found = learner.get(key.as_bytes()).map_err(|e| p2p::Error(e.to_string()))?;
+        match found {
+            Some(value) => return String::from_utf8(value).map_err(|e| p2p::Error(e.to_string())),
+            None if waited_ms < GET_RETRY_BUDGET_MS => {
+                gloo_timers::future::TimeoutFuture::new(GET_RETRY_INTERVAL_MS).await;
+                waited_ms += GET_RETRY_INTERVAL_MS;
+            }
+            None => return Err(p2p::Error(format!("key {key:?} not found"))),
+        }
+    }
 }
 
 /// Main-thread handle: the UI's only entry point (see `web-app/README.md`'s
@@ -647,6 +662,42 @@ impl MainHandle {
         into_js_result(resp)
     }
 
+    /// Sends one raw event to the Worker and returns its JSON response --
+    /// the same human-readable JSON shape `pkg/e2edata.Event`/kvctl-cli
+    /// sendevent/`kvmobile.SendEvent` use (e.g.
+    /// `{"event":"get_field","value":"hello"}`, see `shmevent::msg_to_json`'s
+    /// doc comment for the exact field names and how binary values are
+    /// represented). Not used by `main.js`'s UI -- `connect`/`set`/`get`
+    /// cover that -- only by the e2e pipeline's Playwright driver, which
+    /// needs the same raw-event fidelity kvctl-cli's `sendevent` already
+    /// has on desktop/remote and `kvmobile.SendEvent` has on Android,
+    /// rather than only this handle's higher-level Set/Get shape.
+    ///
+    /// Signs with this hop's key (see this module's doc comment, key
+    /// relationship 1) unless the event is one of the two bootstrap
+    /// exceptions (`get_public_key`/`get_private_key`) -- the same
+    /// per-event-type decision `cmd/kvctl-cli`'s `cmdSendEvent` and
+    /// `kvmobile.SendEvent` make, since a caller may legitimately want an
+    /// unsigned bootstrap fetch through this same entry point.
+    pub async fn send_event(&self, event_json: String) -> Result<String, JsValue> {
+        web_sys::console::log_1(&format!("kv-raft-web: [main thread] send_event: {event_json}").into());
+        let mut req = shmevent::msg_from_json(&event_json).map_err(js_shmevent_err)?;
+        if req.id == 0 {
+            req.id = new_id();
+        }
+        let signing_key = if shmevent::requires_signature(req.event_type) {
+            Some(self.ensure_key().await?)
+        } else {
+            None
+        };
+        let resp = self
+            .channel
+            .call(&req, signing_key.as_ref())
+            .await
+            .map_err(js_err)?;
+        shmevent::msg_to_json(&resp).map_err(js_shmevent_err)
+    }
+
     async fn ensure_key(&self) -> Result<SigningKey, JsValue> {
         if let Some(k) = self.signing_key.borrow().clone() {
             return Ok(k);
@@ -681,6 +732,10 @@ impl MainHandle {
 }
 
 fn js_err(e: shmring_ipc::Error) -> JsValue {
+    JsValue::from_str(&e.to_string())
+}
+
+fn js_shmevent_err(e: shmevent::Error) -> JsValue {
     JsValue::from_str(&e.to_string())
 }
 

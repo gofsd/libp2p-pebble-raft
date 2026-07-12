@@ -14,7 +14,10 @@ package kvmobile
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -25,7 +28,10 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 
 	"github.com/gofsd/libp2p-kv-raft/pkg/daemon"
+	"github.com/gofsd/libp2p-kv-raft/pkg/e2edata"
+	"github.com/gofsd/libp2p-kv-raft/pkg/ipc"
 	"github.com/gofsd/libp2p-kv-raft/pkg/shmclient"
+	"github.com/gofsd/libp2p-kv-raft/pkg/shmevent"
 )
 
 // leaderMultiaddr is baked in at build time -- see package doc comment.
@@ -201,6 +207,83 @@ func PeerID() string {
 	mu.Lock()
 	defer mu.Unlock()
 	return peerID
+}
+
+// SendEvent sends one raw pkg/shmevent event to this device's own
+// in-process daemon and returns the JSON response -- the same
+// human-readable JSON shape pkg/e2edata.Event and kvctl-cli sendevent use
+// (e.g. `{"event":"get_field","value":"hello"}`, see that type's doc
+// comment for the exact field names and how binary values are
+// represented). This gives the e2e test pipeline the same raw-event
+// fidelity on Android it already has on desktop/remote via kvctl-cli
+// sendevent, instead of only Submit/Get's higher-level Set/Get. Requires
+// Start to have completed successfully.
+//
+// Unlike Submit/Get, this dials pkg/ipc.Call directly rather than going
+// through the cached *shmclient.Session -- Session only ever signs with
+// the one key it fetched at Open time, but a raw event caller may
+// legitimately want e.g. an unsigned EventGetPublicKey, so the signing
+// decision has to be made per call, the same way kvctl-cli's cmdSendEvent
+// does it.
+func SendEvent(eventJSON string) (string, error) {
+	mu.Lock()
+	id := peerID
+	ok := started
+	mu.Unlock()
+	if !ok {
+		return "", fmt.Errorf("kvmobile: Start has not completed successfully yet")
+	}
+
+	var ev e2edata.Event
+	if err := json.Unmarshal([]byte(eventJSON), &ev); err != nil {
+		return "", fmt.Errorf("kvmobile: parse event json: %w", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), callTimeout)
+	defer cancel()
+
+	var priv shmevent.PrivateKey
+	if shmevent.RequiresSignature(ev.EventType) {
+		keyResp, err := ipc.Call(ctx, id, shmevent.Msg{EventType: shmevent.EventGetPrivateKey, ID: randomID()}, nil)
+		if err != nil {
+			return "", fmt.Errorf("kvmobile: fetch signing key: %w", err)
+		}
+		if keyResp.EventType == shmevent.EventError {
+			return "", fmt.Errorf("kvmobile: fetch signing key: %s", keyResp.Value)
+		}
+		priv = shmevent.PrivateKey(keyResp.Value)
+	}
+
+	msg := ev.ToMsg()
+	if msg.ID == 0 {
+		msg.ID = randomID()
+	}
+	resp, err := ipc.Call(ctx, id, msg, priv)
+	if err != nil {
+		return "", fmt.Errorf("kvmobile: send event: %w", err)
+	}
+
+	out, err := json.Marshal(e2edata.EventFromMsg(resp))
+	if err != nil {
+		return "", fmt.Errorf("kvmobile: encode response: %w", err)
+	}
+	return string(out), nil
+}
+
+// randomID returns a random non-zero id -- 0 is reserved meaning
+// "SourceID/DestinationID not used" (see api/shmevent.capnp), so a real
+// message's own id avoids it too. Mirrors pkg/shmclient.newID and
+// cmd/kvctl-cli's randomID.
+func randomID() uint16 {
+	for {
+		var b [2]byte
+		if _, err := rand.Read(b[:]); err != nil {
+			return 1
+		}
+		if id := binary.BigEndian.Uint16(b[:]); id != 0 {
+			return id
+		}
+	}
 }
 
 // ensureIdentity loads the Ed25519 identity persisted under dataDir from a

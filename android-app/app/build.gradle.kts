@@ -13,6 +13,9 @@ android {
         targetSdk = 36
         versionCode = 1
         versionName = "1.0"
+        // Drives E2ETest (see src/androidTest) -- pkg/e2erun's Android
+        // execution path runs it via `adb shell am instrument`.
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
     buildTypes {
@@ -35,4 +38,7 @@ android {
 
 dependencies {
     implementation(files("libs/kvmobile.aar"))
+    androidTestImplementation(files("libs/kvmobile.aar"))
+    androidTestImplementation("androidx.test.ext:junit:1.2.1")
+    androidTestImplementation("androidx.test:runner:1.6.2")
 }
