@@ -2,6 +2,9 @@
 name = "kv-raft-web"
 version = "0.1.0"
 edition = "2021"
+description = "Browser client for libp2p-kv-raft: a real (non-voting) hashicorp/raft learner compiled to wasm32-unknown-unknown"
+repository = "https://github.com/gofsd/libp2p-kv-raft"
+publish = false
 
 [lib]
 crate-type = ["cdylib", "rlib"]

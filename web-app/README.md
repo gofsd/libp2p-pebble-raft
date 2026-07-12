@@ -80,13 +80,21 @@ npm run dev
 ```
 
 Two things need to be on `PATH` beyond the usual Rust toolchain, neither of which needs root if
-your package manager doesn't have them: a C compiler (`cc`/`clang`, for `sqlite-wasm-rs`'s build
-script, which compiles SQLite's C amalgamation targeting `wasm32-unknown-unknown`) and the Cap'n
-Proto schema compiler (`capnp`, for `build.rs`'s `capnp compile` -- see `api/shmevent.capnp`;
-`capnpc`, the Rust codegen backend, is a normal Cargo build-dependency and needs nothing extra).
-Cap'n Proto builds cleanly from source in a user-local prefix with just `cmake`/`g++`/`pkg-config`
-(`cmake .. -DCMAKE_INSTALL_PREFIX=$HOME/.local && cmake --build . && cmake --install .` from a
-`capnproto` release tarball's `c++/` directory) if it isn't packaged wherever this runs.
+your package manager doesn't have them:
+
+- The Cap'n Proto schema compiler (`capnp`, for `build.rs`'s `capnp compile` -- see
+  `api/shmevent.capnp`; `capnpc`, the Rust codegen backend, is a normal Cargo build-dependency and
+  needs nothing extra). Builds cleanly from source in a user-local prefix with just
+  `cmake`/`g++`/`pkg-config` (`cmake .. -DCMAKE_INSTALL_PREFIX=$HOME/.local && cmake --build . &&
+  cmake --install .` from a `capnproto` release tarball's `c++/` directory) if it isn't packaged
+  wherever this runs.
+- A C compiler that can target `wasm32-unknown-unknown`, for `sqlite-wasm-rs`'s build script
+  (compiles SQLite's C amalgamation). `.cargo/config.toml` points `CC_wasm32_unknown_unknown` at
+  `.cargo/wasm-cc.sh`, which prefers a real `clang` already on `PATH` and otherwise falls back to
+  [`zig cc`](https://ziglang.org/) (a full clang, bundled in a single ~55 MB download with no root
+  needed -- `tar xf zig-*.tar.xz` and put the extracted directory's `zig` binary on `PATH`; no
+  further setup). Verified working end to end this way: `wasm-pack build --target web --out-dir
+  pkg` and `npx vite build` both produce a real, complete bundle.
 
 ## Running it
 
@@ -119,31 +127,28 @@ file's doc comment); it's skipped with no cluster running.
 
 ## Known gaps / what to verify before relying on this
 
-This was built and its core logic verified in a sandboxed environment with `cargo`/`rustc` and
-(after building it from source into a user prefix -- see "Building" above) `capnp`, but no C
-compiler with wasm32 support and no ability to launch a real browser or a live cluster. Verified:
+This was built and its core logic verified in a sandboxed environment with `cargo`/`rustc`,
+`capnp` (built from source into a user prefix), and a wasm32-capable C compiler (via `zig cc` --
+see "Building" above), but no ability to launch a real browser or a live cluster. Verified:
 
 - `cargo test` (native): the entire msgpack/raft-wire codec, `pkg/kvfsm` byte compatibility, and
   the `shmevent` capnp codec (encode/decode, CRC32 corruption detection, Ed25519 sign/verify
   including tamper detection, and the two-bootstrap-event unsigned exception) -- all passing, and
   the `pkg/shmevent` Go twin generated from the same `api/shmevent.capnp` schema has its own
   equivalent passing suite (`go test ./pkg/shmevent/...`).
-- `cargo check --target wasm32-unknown-unknown`: the full `rust-libp2p` `Swarm` construction
-  (WebTransport transport, relay client, `libp2p-stream`), the shmring main/worker channel carrying
-  `shmevent::Msg`, and the `wasm-bindgen` entry points (including the two-key signing flow in
-  `app.rs`) all type-check against the real crate APIs (`sqlite-wasm-rs`'s code was verified
-  separately against a stub with byte-identical FFI signatures, since its own build needs `clang`
-  specifically, not just any C compiler `capnp` happened to need).
+- `wasm-pack build --target web --out-dir pkg` succeeds for real (not just `cargo check`) and
+  produces a genuine, complete bundle (`kv_raft_web_bg.wasm`, ~2.7 MB, plus its JS glue) --
+  `sqlite-wasm-rs`'s SQLite-to-wasm32 compile included, no stub needed. `npx vite build` then
+  packages that bundle with `main.js`/`worker.js`/`index.html` into a working `dist/` with no
+  errors.
 - Real Go-side integration tests: `pkg/daemon.TestAddLearnerThroughRelay` exercises the *exact*
   wire sequence `app.rs`'s `do_connect` performs -- unsigned `GetPrivateKey` bootstrap, then a
   signed `SetKey`+`EventAdd` pair -- against a real leader+relay, proving `AddNonvoter` over a
   relay-reserved address lands in the raft configuration and that the leader's
   `rafttransport.NetworkTransport` really dials it and delivers an `AppendEntries` stream.
 
-Not yet verified (needs a machine with a wasm32 C toolchain for SQLite, a browser, and time to
-run):
+Not yet verified (needs a real browser and a live cluster to drive):
 
-- That `wasm-pack build` actually succeeds and produces a working bundle.
 - A real end-to-end Connect/Set/Get in an actual browser against a live cluster (`tests/set_get.spec.js`
   is written for exactly this, but has not been run).
 - `SqliteStore`'s OPFS-backed persistence path (`sahpool` VFS) -- `sqlite_store.rs` currently
