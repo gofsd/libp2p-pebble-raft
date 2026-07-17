@@ -51,6 +51,33 @@ func TestSetGetDelete(t *testing.T) {
 	}
 }
 
+func TestSetNilValue(t *testing.T) {
+	s, err := store.Open(filepath.Join(t.TempDir(), "sqlite"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+
+	if err := s.Set([]byte("k1"), nil); err != nil {
+		t.Fatalf("Set with nil value: %v", err)
+	}
+	v, err := s.Get([]byte("k1"))
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if len(v) != 0 {
+		t.Fatalf("Get after Set(nil): got %q, want empty", v)
+	}
+
+	// Re-Set that same (possibly nil, per Get's own doc comment) value
+	// under a different key -- the exact read-then-write pattern
+	// kvfsm's OpConfirm performs, and the one that originally surfaced
+	// this as a NOT NULL constraint failure.
+	if err := s.Set([]byte("k2"), v); err != nil {
+		t.Fatalf("Set(k2, <value read back from k1>): %v", err)
+	}
+}
+
 func TestDumpAllLoadAllRoundTrip(t *testing.T) {
 	src, err := store.Open(filepath.Join(t.TempDir(), "sqlite"))
 	if err != nil {

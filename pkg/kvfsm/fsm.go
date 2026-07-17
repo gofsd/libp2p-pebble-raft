@@ -18,6 +18,13 @@ type OpType uint8
 const (
 	OpSet OpType = 1
 	OpDel OpType = 2
+	// OpConfirm promotes a pending pkg/shmevent system record to
+	// confirmed: key is the pending record's own key, value is the
+	// confirmed record's key (not a value -- see Apply's OpConfirm case).
+	// Reuses EncodeCommand/DecodeCommand's existing key+value framing
+	// unchanged; both fields are already opaque byte slices, so no wire
+	// format change was needed for this op.
+	OpConfirm OpType = 3
 )
 
 // EncodeCommand builds the raft log payload for a Set/Delete operation.
@@ -92,6 +99,20 @@ func (f *FSM) Apply(l *raft.Log) any {
 	case OpSet:
 		return ApplyResult{Err: f.Store.Set(key, value)}
 	case OpDel:
+		return ApplyResult{Err: f.Store.Delete(key)}
+	case OpConfirm:
+		// Read-modify-write across two different keys, safe and
+		// deterministic here because Apply runs exactly once, in raft log
+		// order, against each node's own already-caught-up local store --
+		// every node ends up with the identical result without needing
+		// any separate linearizable-read machinery.
+		v, err := f.Store.Get(key)
+		if err != nil {
+			return ApplyResult{Err: fmt.Errorf("kvfsm: confirm: no pending record at key: %w", err)}
+		}
+		if err := f.Store.Set(value, v); err != nil {
+			return ApplyResult{Err: err}
+		}
 		return ApplyResult{Err: f.Store.Delete(key)}
 	default:
 		return ApplyResult{Err: fmt.Errorf("kvfsm: unknown op %d", op)}

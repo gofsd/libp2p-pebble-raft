@@ -59,8 +59,17 @@ func (s *Store) Get(key []byte) ([]byte, error) {
 	return v, nil
 }
 
-// Set writes key/value durably.
+// Set writes key/value durably. A nil value is normalized to an empty
+// (but non-nil) one first: database/sql binds a nil []byte parameter as
+// SQL NULL, which the kv table's value column (NOT NULL) rejects --
+// without this, a value that happens to be nil (e.g. one just read back
+// via Get, which can itself return nil for a previously-stored empty
+// value) could never be Set again elsewhere, silently breaking any
+// read-then-write caller (see kvfsm's OpConfirm, the first such caller).
 func (s *Store) Set(key, value []byte) error {
+	if value == nil {
+		value = []byte{}
+	}
 	_, err := s.db.Exec(`INSERT INTO kv(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`, key, value)
 	return err
 }

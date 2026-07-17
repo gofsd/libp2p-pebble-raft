@@ -68,6 +68,30 @@ const (
 	// their own -- SetKey+SetField remains the only option for a
 	// combined key+value beyond that.
 	EventSet uint8 = 8
+	// EventPermitRequest lodges a pending system record -- a request for a
+	// peer to be permitted onto the cluster's relay (KindPermitPeer) or
+	// for a bootstrap/relay node to be registered (KindBootstrapNode) --
+	// under a reserved key (see SystemKey) so every raft member ends up
+	// knowing about it purely through ordinary FSM replication, the same
+	// as any other Set. Value is EncodePermitRequestPayload(kind, peerID,
+	// metadata). Any raft node may receive and relay one (it's applied
+	// exactly like EventSet, via handleSetForward's existing one-hop
+	// forward-to-leader path) -- see EventPermitConfirm's doc comment for
+	// the second stage, which is restricted.
+	EventPermitRequest uint8 = 9
+	// EventPermitConfirm promotes a pending EventPermitRequest record from
+	// pending to confirmed (see SystemKey's Status* values). Value is
+	// EncodePermitConfirmPayload(kind, peerID) -- no metadata, since the
+	// daemon reads the pending record's own value back out of the store
+	// rather than trusting the caller to resend it. Unlike
+	// EventPermitRequest, only a peer that is currently a raft *voter* may
+	// confirm: any raft node can receive/relay the message, but the
+	// daemon's forwarding path re-checks the *libp2p-authenticated*
+	// identity of whichever node actually originated it against the
+	// leader's live raft configuration before applying -- the per-message
+	// Ed25519 signature alone does not prove this (see pkg/daemon's
+	// handleForwardConfirmStream doc comment).
+	EventPermitConfirm uint8 = 10
 	// EventError is response-only: Value carries a UTF-8 error message,
 	// ID echoes the failed request's ID. Not part of the fields the
 	// protocol was specified with -- added because the struct has no
@@ -96,6 +120,10 @@ func EventName(e uint8) string {
 		return "add"
 	case EventSet:
 		return "set"
+	case EventPermitRequest:
+		return "permit_request"
+	case EventPermitConfirm:
+		return "permit_confirm"
 	case EventError:
 		return "error"
 	default:
@@ -126,6 +154,10 @@ func EventFromName(name string) (uint8, bool) {
 		return EventAdd, true
 	case "set":
 		return EventSet, true
+	case "permit_request":
+		return EventPermitRequest, true
+	case "permit_confirm":
+		return EventPermitConfirm, true
 	case "error":
 		return EventError, true
 	default:

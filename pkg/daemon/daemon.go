@@ -58,6 +58,16 @@ const JoinProtocolID = protocol.ID("/libp2p-kv-raft/join/1.0.0")
 // UI, so every Set it issues needs this to reach the leader at all.
 const ForwardProtocolID = protocol.ID("/libp2p-kv-raft/forward-set/1.0.0")
 
+// ForwardConfirmProtocolID is the libp2p protocol a non-leader node uses
+// to relay an EventPermitConfirm to the current raft leader, mirroring
+// ForwardProtocolID's role for Set. It's a separate protocol (rather than
+// overloading ForwardProtocolID's existing OpSet-only handling) because
+// its handler, unlike handleForwardSetStream, must check the identity of
+// whoever actually opened the stream against the leader's live raft
+// configuration before applying -- see handleForwardConfirmStream's doc
+// comment.
+const ForwardConfirmProtocolID = protocol.ID("/libp2p-kv-raft/forward-confirm/1.0.0")
+
 // ForwardJoinProtocolID is the libp2p protocol a non-leader node uses to
 // relay a Join request to the current raft leader on the joining node's
 // behalf, mirroring ForwardProtocolID's role for Set and for the same
@@ -329,6 +339,7 @@ func start(cfg Config) (*Node, error) {
 	}
 	h.SetStreamHandler(JoinProtocolID, n.handleJoinStream)
 	h.SetStreamHandler(ForwardProtocolID, n.handleForwardSetStream)
+	h.SetStreamHandler(ForwardConfirmProtocolID, n.handleForwardConfirmStream)
 	h.SetStreamHandler(ForwardJoinProtocolID, n.handleForwardJoinStream)
 	h.SetStreamHandler(ClientProtocolID, n.handleClientStream)
 	return n, nil
@@ -650,6 +661,9 @@ func (n *Node) handleShmEvent(ctx context.Context, m shmevent.Msg, crc uint32, s
 		if !ok {
 			return errorMsg(m.ID, fmt.Errorf("no key registered under id %d -- send SetKey first", m.SourceID))
 		}
+		if len(key) > 0 && key[0] == shmevent.SystemKeyPrefix {
+			return errorMsg(m.ID, fmt.Errorf("key namespace starting with 0x00 is reserved for system use"))
+		}
 		if err := n.handleSetForward(ctx, key, m.Value, true); err != nil {
 			return errorMsg(m.ID, err)
 		}
@@ -660,10 +674,36 @@ func (n *Node) handleShmEvent(ctx context.Context, m shmevent.Msg, crc uint32, s
 		if err != nil {
 			return errorMsg(m.ID, err)
 		}
+		if len(key) > 0 && key[0] == shmevent.SystemKeyPrefix {
+			return errorMsg(m.ID, fmt.Errorf("key namespace starting with 0x00 is reserved for system use"))
+		}
 		if err := n.handleSetForward(ctx, key, value, true); err != nil {
 			return errorMsg(m.ID, err)
 		}
 		return shmevent.Msg{EventType: shmevent.EventSet, ID: m.ID}
+
+	case shmevent.EventPermitRequest:
+		kind, peerID, metadata, err := shmevent.DecodePermitRequestPayload(m.Value)
+		if err != nil {
+			return errorMsg(m.ID, err)
+		}
+		key := shmevent.SystemKey(kind, shmevent.StatusPending, peerID)
+		if err := n.handleSetForward(ctx, key, metadata, true); err != nil {
+			return errorMsg(m.ID, err)
+		}
+		return shmevent.Msg{EventType: shmevent.EventPermitRequest, ID: m.ID}
+
+	case shmevent.EventPermitConfirm:
+		kind, peerID, err := shmevent.DecodePermitConfirmPayload(m.Value)
+		if err != nil {
+			return errorMsg(m.ID, err)
+		}
+		pendingKey := shmevent.SystemKey(kind, shmevent.StatusPending, peerID)
+		confirmedKey := shmevent.SystemKey(kind, shmevent.StatusConfirmed, peerID)
+		if err := n.handleConfirmForward(ctx, pendingKey, confirmedKey, true); err != nil {
+			return errorMsg(m.ID, err)
+		}
+		return shmevent.Msg{EventType: shmevent.EventPermitConfirm, ID: m.ID}
 
 	case shmevent.EventGetField:
 		key := m.Value
@@ -1129,6 +1169,132 @@ func (n *Node) handleForwardSetStream(s network.Stream) {
 	if err := n.handleSetForward(context.Background(), key, value, false); err != nil {
 		s.Write([]byte(err.Error()))
 	}
+}
+
+// handleConfirmForward is EventPermitConfirm's counterpart to
+// handleSetForward: applies directly if this node is the leader, or
+// forwards to the leader (one hop only, same allowForward-guarded
+// pattern) if not. When this node *is* the leader, no separate voter
+// check is needed here -- hashicorp/raft guarantees only a Voter can ever
+// hold leader state, so isLeader==true already implies the confirming
+// node is a voter. The forwarded path's voter check happens in
+// handleForwardConfirmStream instead, against the authenticated identity
+// of whichever node actually opened the stream.
+func (n *Node) handleConfirmForward(ctx context.Context, pendingKey, confirmedKey []byte, allowForward bool) error {
+	rf, isLeader, leaderID, err := n.resolveWriteTarget(5 * n.electionTimeout)
+	if err != nil {
+		return err
+	}
+	if isLeader {
+		return n.applyConfirm(rf, pendingKey, confirmedKey)
+	}
+	if !allowForward {
+		return fmt.Errorf("not leader; current leader is %s (already forwarded once)", leaderID)
+	}
+	return n.forwardConfirm(ctx, leaderID, pendingKey, confirmedKey)
+}
+
+func (n *Node) applyConfirm(rf *raft.Raft, pendingKey, confirmedKey []byte) error {
+	cmd := kvfsm.EncodeCommand(kvfsm.OpConfirm, pendingKey, confirmedKey)
+	future := rf.Apply(cmd, 10*n.electionTimeout)
+	if err := future.Error(); err != nil {
+		return err
+	}
+	if res, ok := future.Response().(kvfsm.ApplyResult); ok && res.Err != nil {
+		return res.Err
+	}
+	return nil
+}
+
+// forwardConfirm relays an OpConfirm(pendingKey, confirmedKey) to
+// leaderID over ForwardConfirmProtocolID, mirroring forwardSet's wire
+// convention exactly (kvfsm's own command framing; empty response =
+// success, non-empty = the leader's error message).
+func (n *Node) forwardConfirm(ctx context.Context, leaderID raft.ServerID, pendingKey, confirmedKey []byte) error {
+	pid, err := peer.Decode(string(leaderID))
+	if err != nil {
+		return fmt.Errorf("forward confirm: invalid leader id %s: %w", leaderID, err)
+	}
+	s, err := n.host.NewStream(ctx, pid, ForwardConfirmProtocolID)
+	if err != nil {
+		return fmt.Errorf("forward confirm to leader %s: %w", leaderID, err)
+	}
+	defer s.Close()
+
+	cmd := kvfsm.EncodeCommand(kvfsm.OpConfirm, pendingKey, confirmedKey)
+	if _, err := s.Write(cmd); err != nil {
+		return fmt.Errorf("forward confirm: write to leader %s: %w", leaderID, err)
+	}
+	if err := s.CloseWrite(); err != nil {
+		return fmt.Errorf("forward confirm: close write to leader %s: %w", leaderID, err)
+	}
+
+	respBuf, err := io.ReadAll(s)
+	if err != nil {
+		return fmt.Errorf("forward confirm: read response from leader %s: %w", leaderID, err)
+	}
+	if len(respBuf) > 0 {
+		return fmt.Errorf("forward confirm: %s", respBuf)
+	}
+	return nil
+}
+
+// handleForwardConfirmStream is the leader-side handler for
+// ForwardConfirmProtocolID. Unlike handleForwardSetStream, it checks the
+// stream's libp2p-authenticated remote peer -- s.Conn().RemotePeer(),
+// established by the connection's own handshake and so unforgeable by
+// whatever a caller puts in the message itself -- against the leader's
+// live raft configuration before applying anything, rejecting unless
+// that peer is currently a Voter. This is the actual enforcement of
+// EventPermitConfirm's "only a raft voter may confirm" rule: the
+// generic per-message Ed25519 signature check every event type already
+// gets (see handleShmEvent) only proves the message wasn't corrupted and
+// was signed with whoever's key it was checked against -- for local
+// same-machine shmring IPC that's inherently this same node's own key
+// (see pkg/shmevent's doc comment), which doesn't by itself say anything
+// about cluster membership. The RemotePeer check here is what does.
+func (n *Node) handleForwardConfirmStream(s network.Stream) {
+	defer s.Close()
+
+	remote := s.Conn().RemotePeer()
+	rf := n.getRaft()
+	if rf == nil || !isVoter(rf, raft.ServerID(remote.String())) {
+		fmt.Fprintf(s, "forward confirm: %s is not a current raft voter", remote)
+		return
+	}
+
+	buf, err := io.ReadAll(s)
+	if err != nil {
+		fmt.Fprintf(s, "forward confirm: read command: %v", err)
+		return
+	}
+	op, pendingKey, confirmedKey, err := kvfsm.DecodeCommand(buf)
+	if err != nil {
+		fmt.Fprintf(s, "forward confirm: decode command: %v", err)
+		return
+	}
+	if op != kvfsm.OpConfirm {
+		fmt.Fprintf(s, "forward confirm: expected OpConfirm, got op %d", op)
+		return
+	}
+
+	if err := n.handleConfirmForward(context.Background(), pendingKey, confirmedKey, false); err != nil {
+		s.Write([]byte(err.Error()))
+	}
+}
+
+// isVoter reports whether id is currently a Voter in rf's configuration.
+func isVoter(rf *raft.Raft, id raft.ServerID) bool {
+	cfg := rf.GetConfiguration()
+	if err := cfg.Error(); err != nil {
+		return false
+	}
+	for _, srv := range cfg.Configuration().Servers {
+		if srv.ID == id && srv.Suffrage == raft.Voter {
+			return true
+		}
+	}
+	return false
 }
 
 // handleClientStream is the leader-or-follower-side handler for

@@ -46,6 +46,41 @@
 # registered rows to each other (e.g. a compare-and-swap or a rename); no
 # event defined today sets it.
 #
+# # Cluster-membership system records: PermitRequest/PermitConfirm
+#
+# A raft-replicated catalog of permitted peers and bootstrap/relay nodes
+# lives in the same store as ordinary user data, under keys reserved by
+# a leading 0x00 byte (pkg/shmevent.SystemKey: 0x00, a kind byte, a
+# status byte, then the peer id) -- so every raft member ends up knowing
+# every permitted peer and bootstrap node purely through the FSM
+# replication it already does for Set, no separate broadcast needed.
+# Ordinary Set/EventSet requests are rejected if their key starts with
+# 0x00, reserving the whole namespace.
+#
+# Recording one of these is a two-stage PermitRequest{...} then
+# PermitConfirm{...} exchange -- pack(kind, peerID, metadata) is
+# pkg/shmevent.EncodePermitRequestPayload/EncodePermitConfirmPayload:
+#
+#   1. PermitRequest{value: pack(kind, peerID, metadata), id: X} -- lodges
+#      a pending record. Any raft node may receive and relay this (applied
+#      exactly like a Set, via the existing one-hop forward-to-leader
+#      path) -- a not-yet-permitted peer has no elevated standing to earn
+#      here, so no restriction applies.
+#   2. PermitConfirm{value: pack(kind, peerID), id: Y} -- promotes that
+#      pending record to confirmed. Any raft node may receive/relay this
+#      message too, but unlike PermitRequest it is only *honored* if the
+#      node that actually originated it is currently a raft *voter* --
+#      checked, at the leader, against the forwarding connection's own
+#      libp2p-authenticated identity (see pkg/daemon's
+#      handleForwardConfirmStream), not against anything inside the
+#      message itself. The per-message signature below still applies but
+#      doesn't by itself establish this -- see that comment for why.
+#
+# `kind` distinguishes what a record is about (permitted peer vs.
+# bootstrap node today); values beyond those two are reserved for future
+# system operations built on this same two-stage workflow (e.g. a voter
+# adding/removing another raft voter or learner).
+#
 # `id` is dual-purpose: it's the request/response correlation nonce (a
 # response always echoes the request's `id`, exactly like
 # pkg/ipcproto.Request.ID/Response.ID did), and, because the *client*

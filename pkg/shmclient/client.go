@@ -122,6 +122,51 @@ func (s *Session) Add(ctx context.Context, leaderPeerID string) (string, error) 
 	return string(resp.Value), nil
 }
 
+// RequestPermit lodges a pending permit request for peerID (of the given
+// kind -- shmevent.KindPermitPeer or shmevent.KindBootstrapNode) on the
+// session's node. metadata is opaque, kind-specific data (e.g. a dialable
+// multiaddr for KindBootstrapNode). See shmevent.EventPermitRequest's doc
+// comment: any raft node may receive and relay this.
+func (s *Session) RequestPermit(ctx context.Context, kind byte, peerID, metadata []byte) error {
+	payload, err := shmevent.EncodePermitRequestPayload(kind, peerID, metadata)
+	if err != nil {
+		return fmt.Errorf("shmclient: permit_request: %w", err)
+	}
+	resp, err := ipc.Call(ctx, s.peerID, shmevent.Msg{
+		EventType: shmevent.EventPermitRequest,
+		Value:     payload,
+		ID:        newID(),
+	}, s.priv)
+	if err != nil {
+		return fmt.Errorf("shmclient: permit_request: %w", err)
+	}
+	if resp.EventType == shmevent.EventError {
+		return fmt.Errorf("shmclient: permit_request: %s", resp.Value)
+	}
+	return nil
+}
+
+// ConfirmPermit promotes a pending permit request for peerID (of the
+// given kind) from pending to confirmed. See
+// shmevent.EventPermitConfirm's doc comment: only a peer that is
+// currently a raft voter may confirm -- the session's node will reject
+// this (surfaced as an error here) if it forwards to a leader that
+// determines the confirming node isn't one.
+func (s *Session) ConfirmPermit(ctx context.Context, kind byte, peerID []byte) error {
+	resp, err := ipc.Call(ctx, s.peerID, shmevent.Msg{
+		EventType: shmevent.EventPermitConfirm,
+		Value:     shmevent.EncodePermitConfirmPayload(kind, peerID),
+		ID:        newID(),
+	}, s.priv)
+	if err != nil {
+		return fmt.Errorf("shmclient: permit_confirm: %w", err)
+	}
+	if resp.EventType == shmevent.EventError {
+		return fmt.Errorf("shmclient: permit_confirm: %s", resp.Value)
+	}
+	return nil
+}
+
 // GetPublicKey fetches peerID's Ed25519 public key -- unsigned, since it's
 // one of the two bootstrap events a node accepts without a key to check a
 // signature against yet (see pkg/shmevent.RequiresSignature).
@@ -187,4 +232,24 @@ func Add(ctx context.Context, peerID, leaderPeerID string) (string, error) {
 		return "", err
 	}
 	return s.Add(ctx, leaderPeerID)
+}
+
+// RequestPermit is the one-shot convenience wrapper around
+// Open+Session.RequestPermit.
+func RequestPermit(ctx context.Context, peerID string, kind byte, targetPeerID, metadata []byte) error {
+	s, err := Open(ctx, peerID)
+	if err != nil {
+		return err
+	}
+	return s.RequestPermit(ctx, kind, targetPeerID, metadata)
+}
+
+// ConfirmPermit is the one-shot convenience wrapper around
+// Open+Session.ConfirmPermit.
+func ConfirmPermit(ctx context.Context, peerID string, kind byte, targetPeerID []byte) error {
+	s, err := Open(ctx, peerID)
+	if err != nil {
+		return err
+	}
+	return s.ConfirmPermit(ctx, kind, targetPeerID)
 }
