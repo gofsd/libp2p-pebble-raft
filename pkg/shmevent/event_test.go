@@ -125,7 +125,7 @@ func TestGetPublicPrivateKeyEventsSignWithNilKey(t *testing.T) {
 }
 
 func TestEventNameRoundTrip(t *testing.T) {
-	for _, e := range []uint8{EventSetKey, EventSetField, EventGetKey, EventGetField, EventGetPublicKey, EventGetPrivateKey, EventAdd, EventSet, EventPermitRequest, EventPermitConfirm, EventError} {
+	for _, e := range []uint8{EventSetKey, EventSetField, EventGetKey, EventGetField, EventGetPublicKey, EventGetPrivateKey, EventAdd, EventSet, EventPermitRequest, EventPermitConfirm, EventExecute, EventPollExecute, EventError} {
 		name := EventName(e)
 		got, ok := EventFromName(name)
 		if !ok {
@@ -171,6 +171,40 @@ func TestSetPayloadRoundTrip(t *testing.T) {
 	}
 	if _, _, err := DecodeSetPayload([]byte{0, 10}); err == nil {
 		t.Fatal("DecodeSetPayload unexpectedly accepted a key length exceeding the payload size")
+	}
+}
+
+func TestExecuteNotificationRoundTrip(t *testing.T) {
+	notif, err := EncodeExecuteNotification([]byte("12D3KooWSender"), []byte("payload bytes"))
+	if err != nil {
+		t.Fatalf("EncodeExecuteNotification: %v", err)
+	}
+	sender, payload, err := DecodeExecuteNotification(notif)
+	if err != nil {
+		t.Fatalf("DecodeExecuteNotification: %v", err)
+	}
+	if string(sender) != "12D3KooWSender" || string(payload) != "payload bytes" {
+		t.Fatalf("got sender=%q payload=%q, want sender=%q payload=%q", sender, payload, "12D3KooWSender", "payload bytes")
+	}
+
+	// Empty sender and/or payload must round-trip too.
+	notif, err = EncodeExecuteNotification(nil, []byte("payload bytes"))
+	if err != nil {
+		t.Fatalf("EncodeExecuteNotification with empty sender: %v", err)
+	}
+	sender, payload, err = DecodeExecuteNotification(notif)
+	if err != nil {
+		t.Fatalf("DecodeExecuteNotification with empty sender: %v", err)
+	}
+	if len(sender) != 0 || string(payload) != "payload bytes" {
+		t.Fatalf("got sender=%q payload=%q, want sender=\"\" payload=%q", sender, payload, "payload bytes")
+	}
+
+	if _, _, err := DecodeExecuteNotification([]byte{0}); err == nil {
+		t.Fatal("DecodeExecuteNotification unexpectedly accepted a payload shorter than the length prefix")
+	}
+	if _, _, err := DecodeExecuteNotification([]byte{0, 10}); err == nil {
+		t.Fatal("DecodeExecuteNotification unexpectedly accepted a sender peer id length exceeding the payload size")
 	}
 }
 

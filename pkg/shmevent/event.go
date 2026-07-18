@@ -92,6 +92,39 @@ const (
 	// Ed25519 signature alone does not prove this (see pkg/daemon's
 	// handleForwardConfirmStream doc comment).
 	EventPermitConfirm uint8 = 10
+	// EventExecute is a direct, unreplicated peer-to-peer notification: it
+	// never touches the store or the raft FSM (unlike every event above),
+	// it's just delivered straight to whichever node SourceID/
+	// DestinationID name. SourceID references a prior EventSetKey holding
+	// the *sending* node's own peer id, DestinationID references one
+	// holding the *receiving* node's peer id -- both required, no
+	// implicit "this node" default the way EventAdd's SourceID==0 case
+	// has one. Value is an arbitrary raw payload, up to ValueSize.
+	//
+	// A node that receives this locally (over pkg/ipc or
+	// pkg/daemon.ClientProtocolID) checks that SourceID's registered peer
+	// id is genuinely its own (see handleShmEvent) -- it can only ever be
+	// relaying on its own behalf, since the peer-to-peer hop that follows
+	// is signed with its own key -- then dials DestinationID's peer
+	// directly over pkg/daemon.ExecuteProtocolID (a fresh libp2p stream
+	// between the two raft node processes, not going through raft
+	// consensus at all) and hands it EncodeExecuteNotification(own peer
+	// id, Value). The receiving node verifies that message's signature
+	// against the sender peer id's own Ed25519 public key (embedded in
+	// the peer id itself, the same trick pkg/daemon.recordClusterMember
+	// uses) -- self-contained, not dependent on trusting the stream's
+	// connection identity -- then queues it for local delivery: see
+	// EventPollExecute.
+	EventExecute uint8 = 11
+	// EventPollExecute drains one queued EventExecute notification (see
+	// that event's doc comment) delivered to this node, oldest first.
+	// Value is ignored on the request. The response's Value is empty if
+	// nothing is queued, or EncodeExecuteNotification(senderPeerID,
+	// payload) if one was -- a local caller polls this in a loop (there's
+	// no push transport from daemon to pkg/ipc client -- see pkg/ipc's
+	// doc comment on why it's strictly request/response) to observe
+	// Execute notifications addressed to this node.
+	EventPollExecute uint8 = 12
 	// EventError is response-only: Value carries a UTF-8 error message,
 	// ID echoes the failed request's ID. Not part of the fields the
 	// protocol was specified with -- added because the struct has no
@@ -124,6 +157,10 @@ func EventName(e uint8) string {
 		return "permit_request"
 	case EventPermitConfirm:
 		return "permit_confirm"
+	case EventExecute:
+		return "execute"
+	case EventPollExecute:
+		return "poll_execute"
 	case EventError:
 		return "error"
 	default:
@@ -158,6 +195,10 @@ func EventFromName(name string) (uint8, bool) {
 		return EventPermitRequest, true
 	case "permit_confirm":
 		return EventPermitConfirm, true
+	case "execute":
+		return EventExecute, true
+	case "poll_execute":
+		return EventPollExecute, true
 	case "error":
 		return EventError, true
 	default:
@@ -220,6 +261,39 @@ func DecodeSetPayload(payload []byte) (key, value []byte, err error) {
 		return nil, nil, fmt.Errorf("shmevent: set payload key length %d exceeds payload size %d", keyLen, len(payload))
 	}
 	return payload[2 : 2+keyLen], payload[2+keyLen:], nil
+}
+
+// EncodeExecuteNotification packs senderPeerID and payload into a single
+// value: a 2-byte big-endian length prefix for senderPeerID, then
+// senderPeerID verbatim, then payload -- the rest of the buffer, with no
+// length prefix of its own, mirroring EncodeSetPayload exactly. Used both
+// for the wire message pkg/daemon.ExecuteProtocolID's handler sends (where
+// SourceID/DestinationID have no cross-node meaning, so the sender's peer
+// id travels in Value instead) and for EventPollExecute's response, so a
+// local caller draining its queue learns who an Execute notification came
+// from.
+func EncodeExecuteNotification(senderPeerID, payload []byte) ([]byte, error) {
+	if len(senderPeerID) > 0xFFFF {
+		return nil, fmt.Errorf("shmevent: execute notification sender peer id too long: %d bytes", len(senderPeerID))
+	}
+	buf := make([]byte, 2+len(senderPeerID)+len(payload))
+	buf[0] = byte(len(senderPeerID) >> 8)
+	buf[1] = byte(len(senderPeerID))
+	copy(buf[2:], senderPeerID)
+	copy(buf[2+len(senderPeerID):], payload)
+	return buf, nil
+}
+
+// DecodeExecuteNotification is the inverse of EncodeExecuteNotification.
+func DecodeExecuteNotification(data []byte) (senderPeerID, payload []byte, err error) {
+	if len(data) < 2 {
+		return nil, nil, fmt.Errorf("shmevent: execute notification too short: %d bytes", len(data))
+	}
+	idLen := int(data[0])<<8 | int(data[1])
+	if 2+idLen > len(data) {
+		return nil, nil, fmt.Errorf("shmevent: execute notification sender peer id length %d exceeds payload size %d", idLen, len(data))
+	}
+	return data[2 : 2+idLen], data[2+idLen:], nil
 }
 
 // Encode serializes m to its capnp wire form, computing CRC32 and signing

@@ -42,9 +42,30 @@
 #                                  prior SetKey/registry entry needed.
 #
 # `destinationId` is reserved the same way `sourceId` is -- a second
-# relational reference -- for a future event that needs to relate two
-# registered rows to each other (e.g. a compare-and-swap or a rename); no
-# event defined today sets it.
+# relational reference -- for an event that needs to relate two registered
+# rows to each other. Execute (below) is the first to use it; a future
+# event needing the same shape (e.g. a compare-and-swap or a rename) can
+# reuse the pattern.
+#
+# # Direct peer-to-peer notification: Execute
+#
+# Execute{sourceId: X, destinationId: Y, value: payload, id: Z} is
+# delivered straight from one raft node to another over a dedicated
+# libp2p stream (pkg/daemon.ExecuteProtocolID) -- it never touches the
+# store or goes through raft consensus at all, unlike every event above.
+# X and Y are prior EventSetKey registrations: X the sending node's own
+# peer id, Y the receiving node's. The sending node checks X really is
+# its own identity, then hands the receiving node
+# pkg/shmevent.EncodeExecuteNotification(its own peer id, payload) signed
+# with its own key; the receiving node verifies that signature against
+# the sender peer id's own Ed25519 public key (embedded in the id itself)
+# rather than trusting the stream's connection identity, then queues it.
+# A local caller drains its queue with PollExecute{id: W} (value ignored),
+# whose response value is empty if nothing is queued or that same
+# EncodeExecuteNotification packing otherwise -- see pkg/daemon's
+# handleExecuteStream and pkg/shmevent's EventExecute/EventPollExecute
+# doc comments for the full design, including why polling rather than a
+# push is what's available today.
 #
 # # Cluster-membership system records: PermitRequest/PermitConfirm
 #

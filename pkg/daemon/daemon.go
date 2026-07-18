@@ -95,6 +95,15 @@ const ForwardJoinProtocolID = protocol.ID("/libp2p-kv-raft/forward-join/1.0.0")
 // /p2p-circuit multiaddr -- see handleAddLearner.
 const ClientProtocolID = protocol.ID("/libp2p-kv-raft/client/1.0.0")
 
+// ExecuteProtocolID is the libp2p protocol one raft node uses to deliver an
+// EventExecute notification directly to another, peer-to-peer -- see that
+// event's doc comment in pkg/shmevent. Unlike every other protocol in this
+// file, the message it carries never touches raft or the store at either
+// end: handleExecuteStream just verifies it and queues it in the
+// receiving Node's executeInbox for a local caller to drain via
+// EventPollExecute.
+const ExecuteProtocolID = protocol.ID("/libp2p-kv-raft/execute/1.0.0")
+
 // ReadyFileName is written to Config.DataDir once the daemon's host and IPC
 // server are up, so the spawning `mage addnode` can learn the node's peer id
 // and listen addresses without parsing stdout.
@@ -238,6 +247,14 @@ type Node struct {
 	// SourceID-addressed forms of EventSetField/EventGetField/EventAdd.
 	registry *shmevent.Registry
 
+	// executeInbox queues EventExecute notifications (see that event's doc
+	// comment) delivered to this node over ExecuteProtocolID, for
+	// EventPollExecute to drain. Purely in-memory and never persisted --
+	// unlike everything else this daemon handles, a queued notification
+	// that's lost on restart is an accepted trade-off, not a correctness
+	// bug (see executeInbox's own doc comment).
+	executeInbox *executeInbox
+
 	logStore  *raftboltdb.BoltStore
 	snapStore raft.SnapshotStore
 
@@ -252,6 +269,57 @@ type Node struct {
 	// for tests, which construct many short-lived Nodes in one process).
 	leadershipObserver *raft.Observer
 	leadershipObsCh    chan raft.Observation
+}
+
+// maxExecuteInbox bounds executeInbox: a queue nothing ever drains (no
+// local caller ever polls) would otherwise grow without limit as long as
+// other nodes keep sending EventExecute notifications. Past this many
+// pending entries, the oldest is dropped to make room for the newest --
+// same trade-off a best-effort notification queue with no persistence
+// already implies (see executeInbox's doc comment).
+const maxExecuteInbox = 256
+
+// executeNotification is one queued EventExecute delivery: senderPeerID is
+// the string pkg/shmevent.DecodeExecuteNotification returned (the sending
+// node's own peer id, already signature-verified against it by
+// handleExecuteStream before queuing), payload is that same call's payload.
+type executeNotification struct {
+	senderPeerID []byte
+	payload      []byte
+}
+
+// executeInbox is a bounded FIFO queue of executeNotification, guarded by
+// a mutex -- deliberately the simplest thing that could work rather than
+// a channel, since EventPollExecute needs a non-blocking "is anything
+// there" drain (a closed/empty channel read blocks or needs a select,
+// where a plain slice-under-a-mutex just returns ok=false).
+type executeInbox struct {
+	mu      sync.Mutex
+	entries []executeNotification
+}
+
+func newExecuteInbox() *executeInbox {
+	return &executeInbox{}
+}
+
+func (q *executeInbox) push(senderPeerID, payload []byte) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if len(q.entries) >= maxExecuteInbox {
+		q.entries = q.entries[1:]
+	}
+	q.entries = append(q.entries, executeNotification{senderPeerID: senderPeerID, payload: payload})
+}
+
+func (q *executeInbox) pop() (executeNotification, bool) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if len(q.entries) == 0 {
+		return executeNotification{}, false
+	}
+	n := q.entries[0]
+	q.entries = q.entries[1:]
+	return n, true
 }
 
 // Run starts a node and blocks, serving IPC requests, until ctx is
@@ -362,19 +430,21 @@ func start(cfg Config) (*Node, error) {
 	}
 
 	n := &Node{
-		cfg:         cfg,
-		host:        h,
-		store:       st,
-		peerID:      peerID.String(),
-		ed25519Priv: ed25519Priv,
-		ed25519Pub:  ed25519Pub,
-		registry:    shmevent.NewRegistry(),
-		logStore:    logStore,
-		snapStore:   snapStore,
+		cfg:          cfg,
+		host:         h,
+		store:        st,
+		peerID:       peerID.String(),
+		ed25519Priv:  ed25519Priv,
+		ed25519Pub:   ed25519Pub,
+		registry:     shmevent.NewRegistry(),
+		executeInbox: newExecuteInbox(),
+		logStore:     logStore,
+		snapStore:    snapStore,
 	}
 	h.SetStreamHandler(JoinProtocolID, n.handleJoinStream)
 	h.SetStreamHandler(ForwardProtocolID, n.handleForwardSetStream)
 	h.SetStreamHandler(ForwardConfirmProtocolID, n.handleForwardConfirmStream)
+	h.SetStreamHandler(ExecuteProtocolID, n.handleExecuteStream)
 	h.SetStreamHandler(ForwardJoinProtocolID, n.handleForwardJoinStream)
 	h.SetStreamHandler(ClientProtocolID, n.handleClientStream)
 	return n, nil
@@ -928,6 +998,23 @@ func (n *Node) handleShmEvent(ctx context.Context, m shmevent.Msg, crc uint32, s
 			return errorMsg(m.ID, err)
 		}
 		return shmevent.Msg{EventType: shmevent.EventPermitConfirm, ID: m.ID}
+
+	case shmevent.EventExecute:
+		if err := n.dispatchExecute(ctx, m); err != nil {
+			return errorMsg(m.ID, err)
+		}
+		return shmevent.Msg{EventType: shmevent.EventExecute, ID: m.ID}
+
+	case shmevent.EventPollExecute:
+		notif, ok := n.executeInbox.pop()
+		if !ok {
+			return shmevent.Msg{EventType: shmevent.EventPollExecute, ID: m.ID}
+		}
+		value, err := shmevent.EncodeExecuteNotification(notif.senderPeerID, notif.payload)
+		if err != nil {
+			return errorMsg(m.ID, err)
+		}
+		return shmevent.Msg{EventType: shmevent.EventPollExecute, Value: value, ID: m.ID}
 
 	case shmevent.EventGetField:
 		key := m.Value
@@ -1568,6 +1655,126 @@ func isVoter(rf *raft.Raft, id raft.ServerID) bool {
 		}
 	}
 	return false
+}
+
+// dispatchExecute implements EventExecute (see that event's doc comment
+// in pkg/shmevent): resolves SourceID/DestinationID against this node's
+// own registry, confirms the caller isn't claiming some other node as the
+// sender (this node can only ever relay the peer-to-peer hop below under
+// its own identity, since that's the key it signs with), then delivers
+// it. Never touches n.store or raft.
+func (n *Node) dispatchExecute(ctx context.Context, m shmevent.Msg) error {
+	senderKey, ok := n.registry.Lookup(m.SourceID)
+	if !ok {
+		return fmt.Errorf("execute: no peer id registered under source id %d -- send SetKey first", m.SourceID)
+	}
+	if string(senderKey) != n.peerID {
+		return fmt.Errorf("execute: source %q is not this node's own peer id (%s)", senderKey, n.peerID)
+	}
+	destKey, ok := n.registry.Lookup(m.DestinationID)
+	if !ok {
+		return fmt.Errorf("execute: no peer id registered under destination id %d -- send SetKey first", m.DestinationID)
+	}
+	destPeerID, err := peer.Decode(string(destKey))
+	if err != nil {
+		return fmt.Errorf("execute: invalid destination peer id %q: %w", destKey, err)
+	}
+	return n.sendExecute(ctx, destPeerID, m.Value)
+}
+
+// sendExecute dials dest directly over ExecuteProtocolID -- a fresh
+// peer-to-peer libp2p stream between two raft node processes, entirely
+// outside raft consensus -- and hands it an EventExecute message carrying
+// EncodeExecuteNotification(this node's own peer id, payload), signed
+// with this node's own key. See handleExecuteStream for the receiving
+// side.
+func (n *Node) sendExecute(ctx context.Context, dest peer.ID, payload []byte) error {
+	s, err := n.host.NewStream(ctx, dest, ExecuteProtocolID)
+	if err != nil {
+		return fmt.Errorf("execute: open stream to %s: %w", dest, err)
+	}
+	defer s.Close()
+
+	value, err := shmevent.EncodeExecuteNotification([]byte(n.peerID), payload)
+	if err != nil {
+		return fmt.Errorf("execute: encode notification: %w", err)
+	}
+	buf, err := shmevent.Encode(shmevent.Msg{EventType: shmevent.EventExecute, Value: value}, n.ed25519Priv)
+	if err != nil {
+		return fmt.Errorf("execute: encode message: %w", err)
+	}
+	if _, err := s.Write(buf); err != nil {
+		return fmt.Errorf("execute: write to %s: %w", dest, err)
+	}
+	if err := s.CloseWrite(); err != nil {
+		return fmt.Errorf("execute: close write to %s: %w", dest, err)
+	}
+
+	respBuf, err := io.ReadAll(s)
+	if err != nil {
+		return fmt.Errorf("execute: read response from %s: %w", dest, err)
+	}
+	if len(respBuf) > 0 {
+		return fmt.Errorf("execute: %s", respBuf)
+	}
+	return nil
+}
+
+// handleExecuteStream is the receiving side of ExecuteProtocolID: it
+// decodes the message (Decode itself checks crc32), extracts the claimed
+// sender peer id from the notification payload (see
+// EncodeExecuteNotification), and verifies the signature against *that*
+// peer id's own Ed25519 public key -- embedded in the peer id itself for
+// this project's identities, the same extraction
+// pkg/daemon.recordClusterMember uses -- rather than trusting whichever
+// address dialed in. That's what makes the signature self-contained
+// (matches EventExecute's doc comment: authenticity doesn't depend on the
+// stream's own connection identity), unlike handleForwardConfirmStream's
+// check, which deliberately does the opposite for a different reason (see
+// its own doc comment). On success, queues the notification for
+// EventPollExecute; never touches n.store or raft either way.
+func (n *Node) handleExecuteStream(s network.Stream) {
+	defer s.Close()
+
+	buf, err := io.ReadAll(s)
+	if err != nil {
+		fmt.Fprintf(s, "execute: read: %v", err)
+		return
+	}
+	m, crc, sig, err := shmevent.Decode(buf)
+	if err != nil {
+		fmt.Fprintf(s, "execute: decode: %v", err)
+		return
+	}
+	if m.EventType != shmevent.EventExecute {
+		fmt.Fprintf(s, "execute: expected EventExecute, got %s", shmevent.EventName(m.EventType))
+		return
+	}
+	senderPeerID, payload, err := shmevent.DecodeExecuteNotification(m.Value)
+	if err != nil {
+		fmt.Fprintf(s, "execute: decode notification: %v", err)
+		return
+	}
+	senderPeer, err := peer.Decode(string(senderPeerID))
+	if err != nil {
+		fmt.Fprintf(s, "execute: invalid sender peer id %q: %v", senderPeerID, err)
+		return
+	}
+	senderPub, err := senderPeer.ExtractPublicKey()
+	if err != nil {
+		fmt.Fprintf(s, "execute: extract sender public key: %v", err)
+		return
+	}
+	rawSenderPub, err := senderPub.Raw()
+	if err != nil {
+		fmt.Fprintf(s, "execute: sender public key raw bytes: %v", err)
+		return
+	}
+	if err := shmevent.Verify(shmevent.PublicKey(rawSenderPub), m, crc, sig); err != nil {
+		fmt.Fprintf(s, "execute: %v", err)
+		return
+	}
+	n.executeInbox.push(senderPeerID, payload)
 }
 
 // handleClientStream is the leader-or-follower-side handler for
