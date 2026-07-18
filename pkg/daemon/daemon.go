@@ -193,6 +193,19 @@ type Config struct {
 	// pkg/kvctl's RequestPermit/ConfirmPermit (mage requestpermit/
 	// confirmpermit, kvctl-cli requestpermit/confirmpermit).
 	RequirePermitForRemote bool
+
+	// RequirePermitForRelay gates this node's circuit-relay v2 service
+	// (only meaningful alongside RelayService) on the reserving/connecting
+	// peer having a confirmed KindPermitPeer record -- see that kind's doc
+	// comment ("permission for a peer to join/use the cluster's relay").
+	// Defaults to false: today's behavior, where any peer can reserve a
+	// relay slot or open a relayed circuit through this node with no
+	// allow-listing at all. Independent of RequirePermitForRemote, which
+	// gates the unrelated shmevent/ClientProtocolID RPC layer -- a node
+	// can restrict one without the other. Turning this on requires an
+	// operator to RequestPermit+ConfirmPermit every peer that needs relay
+	// access first, same as RequirePermitForRemote.
+	RequirePermitForRelay bool
 }
 
 // Node is a running daemon instance. Its raft/transport fields are nil
@@ -296,16 +309,16 @@ func start(cfg Config) (*Node, error) {
 		return nil, fmt.Errorf("daemon: derive peer id: %w", err)
 	}
 
-	h, err := newHost(priv, cfg)
-	if err != nil {
-		return nil, fmt.Errorf("daemon: create libp2p host: %w", err)
-	}
-
 	sqliteDir := filepath.Join(cfg.DataDir, "sqlite")
 	st, err := store.Open(sqliteDir)
 	if err != nil {
-		h.Close()
 		return nil, fmt.Errorf("daemon: open store: %w", err)
+	}
+
+	h, err := newHost(priv, cfg, st)
+	if err != nil {
+		st.Close()
+		return nil, fmt.Errorf("daemon: create libp2p host: %w", err)
 	}
 
 	raftDir := filepath.Join(cfg.DataDir, "raft")
@@ -374,8 +387,12 @@ func start(cfg Config) (*Node, error) {
 // as a relay *for others* (RelayService) and forces public reachability
 // when the caller knows it actually has one, e.g. the leader on a public
 // VPS; the resource limits mirror the standalone relay in
-// pkg/raft/node.go's StartRelayNode.
-func newHost(priv crypto.PrivKey, cfg Config) (lp2phost.Host, error) {
+// pkg/raft/node.go's StartRelayNode. st is only consulted when
+// cfg.RequirePermitForRelay is set (see relayACL); it's threaded in here,
+// ahead of any *Node existing, because the ACL closure needs to read
+// confirmed KindPermitPeer records live -- one already-open *store.Store,
+// not a snapshot taken at host-construction time.
+func newHost(priv crypto.PrivKey, cfg Config, st *store.Store) (lp2phost.Host, error) {
 	opts := []libp2p.Option{
 		libp2p.Identity(priv),
 		libp2p.ListenAddrStrings(
@@ -411,8 +428,12 @@ func newHost(priv crypto.PrivKey, cfg Config) (lp2phost.Host, error) {
 		rc.MaxCircuits = 256
 		rc.BufferSize = 4096
 
+		relayOpts := []v2relay.Option{v2relay.WithResources(rc)}
+		if cfg.RequirePermitForRelay {
+			relayOpts = append(relayOpts, v2relay.WithACL(relayACL{store: st}))
+		}
 		opts = append(opts,
-			libp2p.EnableRelayService(v2relay.WithResources(rc)),
+			libp2p.EnableRelayService(relayOpts...),
 			libp2p.ForceReachabilityPublic(),
 		)
 	}
@@ -773,6 +794,27 @@ func (n *Node) isPermittedPeer(id peer.ID) bool {
 func isPermittedPeer(st *store.Store, id peer.ID) bool {
 	_, err := st.Get(shmevent.SystemKey(shmevent.KindPermitPeer, shmevent.StatusConfirmed, []byte(id.String())))
 	return err == nil
+}
+
+// relayACL is the v2relay.ACLFilter wired into newHost via
+// v2relay.WithACL when Config.RequirePermitForRelay is set -- it's what
+// actually makes a confirmed KindPermitPeer record mean "permission for a
+// peer to join/use the cluster's relay" (that kind's doc comment) rather
+// than just gating the unrelated shmevent RPC layer. Both reservation
+// (AllowReserve) and outgoing-connect (AllowConnect) check the peer
+// that's trying to use *this* node's relay service -- the destination in
+// AllowConnect is who src is dialing through the relay, not itself
+// requesting anything, so it's never checked here.
+type relayACL struct {
+	store *store.Store
+}
+
+func (a relayACL) AllowReserve(p peer.ID, _ multiaddr.Multiaddr) bool {
+	return isPermittedPeer(a.store, p)
+}
+
+func (a relayACL) AllowConnect(src peer.ID, _ multiaddr.Multiaddr, _ peer.ID) bool {
+	return isPermittedPeer(a.store, src)
 }
 
 // raft/store/registry operation and returns the Msg to send back -- the
