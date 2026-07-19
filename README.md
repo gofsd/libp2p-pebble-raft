@@ -8,6 +8,10 @@ machine. Nodes can run on separate machines (including behind NAT/cellular, e.g.
 phone) and are driven locally over `github.com/gofsd/shmring` shared-memory IPC rather than a
 network-facing RPC port.
 
+Integrating this repo as a dependency from another Go project (or driving it as a subprocess from
+any language)? See [`docs/library-usage.md`](docs/library-usage.md) for the API-focused guide;
+this file covers this repo's own architecture and `mage` workflow instead.
+
 ## Architecture
 
 - `pkg/daemon` — the long-running node process (`cmd/kvnode`): a libp2p host, a raft instance
