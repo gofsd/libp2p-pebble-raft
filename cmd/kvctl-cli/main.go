@@ -47,6 +47,10 @@ func main() {
 		cmdRequestPermit(os.Args[2:])
 	case "confirmpermit":
 		cmdConfirmPermit(os.Args[2:])
+	case "execute":
+		cmdExecute(os.Args[2:])
+	case "pollexecute":
+		cmdPollExecute(os.Args[2:])
 	case "sendevent":
 		cmdSendEvent(os.Args[2:])
 	default:
@@ -64,6 +68,8 @@ func usage() {
   kvctl-cli get <key>
   kvctl-cli requestpermit <kind: peer|bootstrap> <peerID> <metadata>
   kvctl-cli confirmpermit <kind: peer|bootstrap> <peerID>
+  kvctl-cli execute <destPeerID> <value>
+  kvctl-cli pollexecute
   kvctl-cli sendevent <peerID> <eventJSON>
 
 sendevent sends one raw pkg/shmevent.Msg (JSON-encoded, human-readable, e.g.
@@ -226,6 +232,34 @@ func cmdConfirmPermit(args []string) {
 		fmt.Fprintf(os.Stderr, "confirmpermit: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+func cmdExecute(args []string) {
+	if len(args) != 2 {
+		fmt.Fprintln(os.Stderr, "usage: kvctl-cli execute <destPeerID> <value>")
+		os.Exit(2)
+	}
+	if err := kvctl.Execute(args[0], args[1]); err != nil {
+		fmt.Fprintf(os.Stderr, "execute: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func cmdPollExecute(args []string) {
+	if len(args) != 0 {
+		fmt.Fprintln(os.Stderr, "usage: kvctl-cli pollexecute")
+		os.Exit(2)
+	}
+	senderPeerID, value, ok, err := kvctl.PollExecute()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "pollexecute: %v\n", err)
+		os.Exit(1)
+	}
+	if !ok {
+		fmt.Println("(no execute notification pending)")
+		return
+	}
+	fmt.Printf("%s: %s\n", senderPeerID, value)
 }
 
 // sendEventTimeout bounds both the optional GetPrivateKey signing-key
