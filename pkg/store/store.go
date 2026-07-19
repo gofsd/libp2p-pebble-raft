@@ -99,6 +99,79 @@ func (s *Store) CountPrefix(prefix []byte) (int, error) {
 	return count, nil
 }
 
+// KV is one key/value pair, as returned by ScanRange/ScanPrefix.
+type KV struct {
+	Key   []byte
+	Value []byte
+}
+
+// ScanRange returns every stored pair with start <= key <= end, ascending
+// by key (SQLite compares BLOBs byte-wise, so this is a plain lexical
+// range over the raw key bytes -- see pkg/logrecord for a key scheme
+// built around that property). limit caps how many pairs are returned;
+// limit <= 0 means unlimited.
+func (s *Store) ScanRange(start, end []byte, limit int) ([]KV, error) {
+	query := `SELECT key, value FROM kv WHERE key >= ? AND key <= ? ORDER BY key`
+	args := []any{start, end}
+	if limit > 0 {
+		query += ` LIMIT ?`
+		args = append(args, limit)
+	}
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []KV
+	for rows.Next() {
+		var kv KV
+		if err := rows.Scan(&kv.Key, &kv.Value); err != nil {
+			return nil, err
+		}
+		out = append(out, kv)
+	}
+	return out, rows.Err()
+}
+
+// ScanPrefix returns every stored pair whose key begins with prefix,
+// ascending by key -- the same prefixUpperBound range trick CountPrefix
+// already uses (key >= prefix AND key < prefixUpperBound(prefix)), except
+// selecting the rows themselves instead of just counting them. Unlike
+// ScanRange, the upper bound here is exclusive, since prefixUpperBound
+// returns the smallest key past every key starting with prefix, not a
+// member of that set itself. limit caps how many pairs are returned;
+// limit <= 0 means unlimited.
+func (s *Store) ScanPrefix(prefix []byte, limit int) ([]KV, error) {
+	upper := prefixUpperBound(prefix)
+	query := `SELECT key, value FROM kv WHERE key >= ?`
+	args := []any{prefix}
+	if upper != nil {
+		query += ` AND key < ?`
+		args = append(args, upper)
+	}
+	query += ` ORDER BY key`
+	if limit > 0 {
+		query += ` LIMIT ?`
+		args = append(args, limit)
+	}
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []KV
+	for rows.Next() {
+		var kv KV
+		if err := rows.Scan(&kv.Key, &kv.Value); err != nil {
+			return nil, err
+		}
+		out = append(out, kv)
+	}
+	return out, rows.Err()
+}
+
 // prefixUpperBound returns the smallest byte sequence greater than every
 // sequence starting with prefix -- prefix with its last non-0xFF byte
 // incremented, carrying into preceding bytes as needed (the standard

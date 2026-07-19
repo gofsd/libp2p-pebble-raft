@@ -53,6 +53,10 @@ func main() {
 		cmdExecute(os.Args[2:])
 	case "pollexecute":
 		cmdPollExecute(os.Args[2:])
+	case "logappend":
+		cmdLogAppend(os.Args[2:])
+	case "logquery":
+		cmdLogQuery(os.Args[2:])
 	case "sendevent":
 		cmdSendEvent(os.Args[2:])
 	default:
@@ -73,6 +77,8 @@ func usage() {
   kvctl-cli revokepermit <kind: peer|bootstrap> <peerID>
   kvctl-cli execute <destPeerID> <value>
   kvctl-cli pollexecute
+  kvctl-cli logappend <kind> <unitID> <fieldsJSON> <narrative>
+  kvctl-cli logquery <kind> <unitID> [-since RFC3339] [-until RFC3339] [-limit N]
   kvctl-cli sendevent <peerID> <eventJSON>
 
 sendevent sends one raw pkg/shmevent.Msg (JSON-encoded, human-readable, e.g.
@@ -279,6 +285,69 @@ func cmdPollExecute(args []string) {
 		return
 	}
 	fmt.Printf("%s: %s\n", senderPeerID, value)
+}
+
+func cmdLogAppend(args []string) {
+	if len(args) != 4 {
+		fmt.Fprintln(os.Stderr, "usage: kvctl-cli logappend <kind> <unitID> <fieldsJSON> <narrative>")
+		os.Exit(2)
+	}
+	var fields map[string]string
+	if args[2] != "" {
+		if err := json.Unmarshal([]byte(args[2]), &fields); err != nil {
+			fmt.Fprintf(os.Stderr, "logappend: decode fieldsJSON: %v\n", err)
+			os.Exit(2)
+		}
+	}
+	if err := kvctl.LogAppend(args[0], args[1], fields, args[3]); err != nil {
+		fmt.Fprintf(os.Stderr, "logappend: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func cmdLogQuery(args []string) {
+	fs := flag.NewFlagSet("logquery", flag.ExitOnError)
+	since := fs.String("since", "", "RFC3339 lower time bound, inclusive (default: unbounded)")
+	until := fs.String("until", "", "RFC3339 upper time bound, inclusive (default: now)")
+	limit := fs.Int("limit", 0, "maximum records to return (0 = unlimited)")
+	fs.Parse(args)
+
+	if fs.NArg() != 2 {
+		fmt.Fprintln(os.Stderr, "usage: kvctl-cli logquery <kind> <unitID> [-since RFC3339] [-until RFC3339] [-limit N]")
+		os.Exit(2)
+	}
+	start := time.Unix(0, 0)
+	if *since != "" {
+		t, err := time.Parse(time.RFC3339, *since)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "logquery: -since: %v\n", err)
+			os.Exit(2)
+		}
+		start = t
+	}
+	end := time.Now()
+	if *until != "" {
+		t, err := time.Parse(time.RFC3339, *until)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "logquery: -until: %v\n", err)
+			os.Exit(2)
+		}
+		end = t
+	}
+
+	records, err := kvctl.LogQuery(fs.Arg(0), fs.Arg(1), start, end, *limit)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "logquery: %v\n", err)
+		os.Exit(1)
+	}
+	for _, rec := range records {
+		out, err := json.Marshal(rec)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "logquery: encode result: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println(string(out))
+	}
 }
 
 // sendEventTimeout bounds both the optional GetPrivateKey signing-key

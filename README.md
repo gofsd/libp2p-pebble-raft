@@ -210,6 +210,43 @@ UI takes it at runtime, closer to desktop's `mage addfollower <addr>`. See `web-
 the full architecture and its currently-unverified-in-CI gaps (needs a wasm32 C toolchain for
 SQLite, and a real browser + live cluster to exercise end to end).
 
+## Log records
+
+`pkg/logrecord` is a generic, replicated structured-record store built on top of the
+same raft-backed KV path ordinary `set`/`get` use — for staff journals, situation
+reports, casualty reports, or any other append-heavy structured record type an operator
+wants to keep. It's deliberately generic: `kind` (e.g. `"sitrep"`, `"journal"`,
+`"casrep"`, anything) is a plain string chosen at call time, not a fixed list baked into
+the code, and `Record`'s `Fields`/`Narrative` are an open envelope — this package makes
+no claim to implementing any report format's real standardized field layout (those vary
+by service, nation, and doctrine); populate them however your own reporting standard
+requires.
+
+```bash
+mage logappend sitrep 1BCT '{"posture":"green"}' "no significant activity"
+mage logappend sitrep 1BCT '{"posture":"amber"}' "increased patrol activity, sector 4"
+mage logquery sitrep 1BCT             # every sitrep record for unit 1BCT, oldest first
+mage logquery sitrep 1BCT "" "" 10    # same, capped at 10 records
+```
+
+Every record's key packs `kind` + `unitID` + a nanosecond timestamp so that "every
+record of this kind and unit, in a time window, in order" is a plain ordered range scan
+(`pkg/store.Store.ScanRange`, exposed remotely as `pkg/shmevent.EventListRange`) —
+`logquery`'s optional third/fourth arguments are RFC3339 `since`/`until` bounds. Writing
+a record goes through the same raft-replicated `handleSetForward` path an ordinary `Set`
+does, under a key inside a reserved namespace (`logrecord.LogKeyPrefix`, alongside the
+existing `shmevent.SystemKeyPrefix` reserved for permits/cluster membership) that an
+ordinary caller-supplied key can never collide with — reached through its own
+`shmevent.EventLogAppend` event rather than plain `Set`, since `Set`/`SetField`
+themselves reject that reserved namespace outright.
+
+Two accepted v1 limits, not oversights: a record's JSON encoding shares the same
+512-byte `Set` payload budget as everything else (`shmevent.ValueSize`), leaving roughly
+400-470 bytes for `Fields`+`Narrative` combined — tight for a long narrative; and there's
+no entry cap or rotation policy, since silently dropping old journal entries once a
+count limit is hit would be actively wrong for a logbook. Both are left for a future pass
+if they turn out to matter in practice.
+
 ## Vendored dependency patch
 
 `thirdparty/anet` is a local, patched copy of `github.com/wlynxg/anet` (pinned via a `replace`

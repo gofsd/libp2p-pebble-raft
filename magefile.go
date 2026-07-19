@@ -10,7 +10,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Masterminds/semver/v3"
 	"github.com/magefile/mage/mg"
@@ -876,6 +878,72 @@ func PollExecute() error {
 		return nil
 	}
 	fmt.Printf("%s: %s\n", senderPeerID, value)
+	return nil
+}
+
+// LogAppend appends a pkg/logrecord.Record of the given kind/unit,
+// timestamped now and attributed to the current node -- see
+// pkg/logrecord's doc comment for the generic key/record scheme this
+// project builds structured log/report records on top of. kind and
+// unitID are entirely caller-chosen strings, not a fixed set. fieldsJSON
+// may be "" (no structured fields).
+// Usage: mage logappend <kind> <unitID> <fieldsJSON> <narrative>
+func LogAppend(kind, unitID, fieldsJSON, narrative string) error {
+	var fields map[string]string
+	if fieldsJSON != "" {
+		if err := json.Unmarshal([]byte(fieldsJSON), &fields); err != nil {
+			return fmt.Errorf("decode fieldsJSON: %w", err)
+		}
+	}
+	if err := kvctl.LogAppend(kind, unitID, fields, narrative); err != nil {
+		return err
+	}
+	fmt.Println("✅ log appended")
+	return nil
+}
+
+// LogQuery lists every pkg/logrecord.Record of the given kind/unit whose
+// timestamp falls in [since, until], oldest first, one JSON object per
+// line. since/until are RFC3339 or "" (since "" = unbounded, until "" =
+// now). limit is a count or "" (unlimited).
+// Usage: mage logquery <kind> <unitID> <since|""> <until|""> <limit|"">
+func LogQuery(kind, unitID, since, until, limit string) error {
+	start := time.Unix(0, 0)
+	if since != "" {
+		t, err := time.Parse(time.RFC3339, since)
+		if err != nil {
+			return fmt.Errorf("since: %w", err)
+		}
+		start = t
+	}
+	end := time.Now()
+	if until != "" {
+		t, err := time.Parse(time.RFC3339, until)
+		if err != nil {
+			return fmt.Errorf("until: %w", err)
+		}
+		end = t
+	}
+	n := 0
+	if limit != "" {
+		v, err := strconv.Atoi(limit)
+		if err != nil {
+			return fmt.Errorf("limit: %w", err)
+		}
+		n = v
+	}
+
+	records, err := kvctl.LogQuery(kind, unitID, start, end, n)
+	if err != nil {
+		return err
+	}
+	for _, rec := range records {
+		out, err := json.Marshal(rec)
+		if err != nil {
+			return err
+		}
+		fmt.Println(string(out))
+	}
 	return nil
 }
 

@@ -198,6 +198,106 @@ func TestCountPrefix(t *testing.T) {
 	}
 }
 
+func TestScanRange(t *testing.T) {
+	s, err := store.Open(filepath.Join(t.TempDir(), "sqlite"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+
+	entries := [][2]string{
+		{string([]byte{0x01, 0x00}), "a"},
+		{string([]byte{0x01, 0x05}), "b"},
+		{string([]byte{0x01, 0x09}), "c"},
+		{string([]byte{0x02, 0x00}), "outside"},
+	}
+	for _, e := range entries {
+		if err := s.Set([]byte(e[0]), []byte(e[1])); err != nil {
+			t.Fatalf("Set: %v", err)
+		}
+	}
+
+	got, err := s.ScanRange([]byte{0x01, 0x00}, []byte{0x01, 0x09}, 0)
+	if err != nil {
+		t.Fatalf("ScanRange: %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("ScanRange returned %d entries, want 3: %+v", len(got), got)
+	}
+	wantOrder := []string{"a", "b", "c"}
+	for i, kv := range got {
+		if string(kv.Value) != wantOrder[i] {
+			t.Fatalf("ScanRange[%d] = %q, want %q (must be ascending by key)", i, kv.Value, wantOrder[i])
+		}
+	}
+
+	// A tighter range must exclude the endpoints outside it.
+	got, err = s.ScanRange([]byte{0x01, 0x01}, []byte{0x01, 0x08}, 0)
+	if err != nil {
+		t.Fatalf("ScanRange (tight): %v", err)
+	}
+	if len(got) != 1 || string(got[0].Value) != "b" {
+		t.Fatalf("ScanRange (tight) = %+v, want just {b}", got)
+	}
+
+	// limit caps the result count without affecting ordering.
+	got, err = s.ScanRange([]byte{0x01, 0x00}, []byte{0x01, 0x09}, 2)
+	if err != nil {
+		t.Fatalf("ScanRange (limit=2): %v", err)
+	}
+	if len(got) != 2 || string(got[0].Value) != "a" || string(got[1].Value) != "b" {
+		t.Fatalf("ScanRange (limit=2) = %+v, want {a, b}", got)
+	}
+}
+
+func TestScanPrefix(t *testing.T) {
+	s, err := store.Open(filepath.Join(t.TempDir(), "sqlite"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+
+	entries := map[string]string{
+		string([]byte{0x00, 0x01, 0x02, 'a'}): "1",
+		string([]byte{0x00, 0x01, 0x02, 'b'}): "2",
+		string([]byte{0x00, 0x01, 0x03, 'a'}): "3",
+		string([]byte{0xFF}):                  "4",
+	}
+	for k, v := range entries {
+		if err := s.Set([]byte(k), []byte(v)); err != nil {
+			t.Fatalf("Set(%x): %v", k, err)
+		}
+	}
+
+	prefix := []byte{0x00, 0x01, 0x02}
+	got, err := s.ScanPrefix(prefix, 0)
+	if err != nil {
+		t.Fatalf("ScanPrefix(%x): %v", prefix, err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("ScanPrefix(%x) returned %d entries, want 2: %+v", prefix, len(got), got)
+	}
+	for _, kv := range got {
+		if !bytes.HasPrefix(kv.Key, prefix) {
+			t.Fatalf("ScanPrefix(%x) returned key %x not matching the prefix", prefix, kv.Key)
+		}
+	}
+
+	// A prefix ending in 0xFF exercises prefixUpperBound's carry logic,
+	// same boundary case TestCountPrefix already covers for CountPrefix.
+	if err := s.Set([]byte{0x00, 0xFF, 'x'}, []byte("5")); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	carryPrefix := []byte{0x00, 0xFF}
+	got, err = s.ScanPrefix(carryPrefix, 0)
+	if err != nil {
+		t.Fatalf("ScanPrefix(%x): %v", carryPrefix, err)
+	}
+	if len(got) != 1 || string(got[0].Value) != "5" {
+		t.Fatalf("ScanPrefix(%x) = %+v, want just {5} (must not also match the unrelated 0xFF top-level key)", carryPrefix, got)
+	}
+}
+
 func TestReopenPersists(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "sqlite")
 

@@ -38,6 +38,7 @@ import (
 
 	"github.com/gofsd/libp2p-kv-raft/pkg/ipc"
 	"github.com/gofsd/libp2p-kv-raft/pkg/kvfsm"
+	"github.com/gofsd/libp2p-kv-raft/pkg/logrecord"
 	"github.com/gofsd/libp2p-kv-raft/pkg/rafttransport"
 	"github.com/gofsd/libp2p-kv-raft/pkg/registry"
 	"github.com/gofsd/libp2p-kv-raft/pkg/shmevent"
@@ -894,6 +895,28 @@ func (n *Node) isClusterMember(id peer.ID) bool {
 	return err == nil
 }
 
+// rejectReservedKey refuses an ordinary EventSet/EventSetField write
+// whose key starts with a byte this codebase reserves for its own
+// internal bookkeeping -- shmevent.SystemKeyPrefix (permits/bootstrap
+// nodes/cluster membership) or logrecord.LogKeyPrefix (log records) --
+// so a caller can never collide with (or corrupt) either namespace by
+// chance or malice. Both prefixes are single reserved bytes checked the
+// same way; kept as one helper so a third reserved namespace only needs
+// one new case here, not a change at every call site.
+func rejectReservedKey(key []byte) error {
+	if len(key) == 0 {
+		return nil
+	}
+	switch key[0] {
+	case shmevent.SystemKeyPrefix:
+		return fmt.Errorf("key namespace starting with 0x%02x is reserved for system use", shmevent.SystemKeyPrefix)
+	case logrecord.LogKeyPrefix:
+		return fmt.Errorf("key namespace starting with 0x%02x is reserved for logrecord use", logrecord.LogKeyPrefix)
+	default:
+		return nil
+	}
+}
+
 // relayACL is the v2relay.ACLFilter wired into newHost via
 // v2relay.WithACL when Config.RequirePermitForRelay is set -- it's what
 // actually makes a confirmed KindPermitPeer record mean "permission for a
@@ -964,8 +987,8 @@ func (n *Node) handleShmEvent(ctx context.Context, m shmevent.Msg, crc uint32, s
 		if !ok {
 			return errorMsg(m.ID, fmt.Errorf("no key registered under id %d -- send SetKey first", m.SourceID))
 		}
-		if len(key) > 0 && key[0] == shmevent.SystemKeyPrefix {
-			return errorMsg(m.ID, fmt.Errorf("key namespace starting with 0x00 is reserved for system use"))
+		if err := rejectReservedKey(key); err != nil {
+			return errorMsg(m.ID, err)
 		}
 		if err := n.handleSetForward(ctx, key, m.Value, true); err != nil {
 			return errorMsg(m.ID, err)
@@ -977,8 +1000,8 @@ func (n *Node) handleShmEvent(ctx context.Context, m shmevent.Msg, crc uint32, s
 		if err != nil {
 			return errorMsg(m.ID, err)
 		}
-		if len(key) > 0 && key[0] == shmevent.SystemKeyPrefix {
-			return errorMsg(m.ID, fmt.Errorf("key namespace starting with 0x00 is reserved for system use"))
+		if err := rejectReservedKey(key); err != nil {
+			return errorMsg(m.ID, err)
 		}
 		if err := n.handleSetForward(ctx, key, value, true); err != nil {
 			return errorMsg(m.ID, err)
@@ -1079,6 +1102,37 @@ func (n *Node) handleShmEvent(ctx context.Context, m shmevent.Msg, crc uint32, s
 			return errorMsg(m.ID, err)
 		}
 		return shmevent.Msg{EventType: shmevent.EventGetField, ID: m.ID, Value: value}
+
+	case shmevent.EventListRange:
+		start, end, err := shmevent.DecodeListRangeQuery(m.Value)
+		if err != nil {
+			return errorMsg(m.ID, err)
+		}
+		matches, err := n.store.ScanRange(start, end, 1)
+		if err != nil {
+			return errorMsg(m.ID, err)
+		}
+		if len(matches) == 0 {
+			return shmevent.Msg{EventType: shmevent.EventListRange, ID: m.ID}
+		}
+		value, err := shmevent.EncodeListRangeQuery(matches[0].Key, matches[0].Value)
+		if err != nil {
+			return errorMsg(m.ID, err)
+		}
+		return shmevent.Msg{EventType: shmevent.EventListRange, ID: m.ID, Value: value}
+
+	case shmevent.EventLogAppend:
+		key, value, err := shmevent.DecodeSetPayload(m.Value)
+		if err != nil {
+			return errorMsg(m.ID, err)
+		}
+		if len(key) == 0 || key[0] != logrecord.LogKeyPrefix {
+			return errorMsg(m.ID, fmt.Errorf("log_append: key must start with the reserved logrecord prefix"))
+		}
+		if err := n.handleSetForward(ctx, key, value, true); err != nil {
+			return errorMsg(m.ID, err)
+		}
+		return shmevent.Msg{EventType: shmevent.EventLogAppend, ID: m.ID}
 
 	case shmevent.EventGetPublicKey:
 		return shmevent.Msg{EventType: shmevent.EventGetPublicKey, ID: m.ID, Value: n.ed25519Pub}

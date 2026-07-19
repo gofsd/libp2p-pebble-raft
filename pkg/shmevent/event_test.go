@@ -125,7 +125,7 @@ func TestGetPublicPrivateKeyEventsSignWithNilKey(t *testing.T) {
 }
 
 func TestEventNameRoundTrip(t *testing.T) {
-	for _, e := range []uint8{EventSetKey, EventSetField, EventGetKey, EventGetField, EventGetPublicKey, EventGetPrivateKey, EventAdd, EventSet, EventPermitRequest, EventPermitConfirm, EventExecute, EventPollExecute, EventPermitRevoke, EventError} {
+	for _, e := range []uint8{EventSetKey, EventSetField, EventGetKey, EventGetField, EventGetPublicKey, EventGetPrivateKey, EventAdd, EventSet, EventPermitRequest, EventPermitConfirm, EventExecute, EventPollExecute, EventPermitRevoke, EventListRange, EventLogAppend, EventError} {
 		name := EventName(e)
 		got, ok := EventFromName(name)
 		if !ok {

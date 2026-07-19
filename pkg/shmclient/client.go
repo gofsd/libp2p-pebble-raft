@@ -82,6 +82,32 @@ func (s *Session) Set(ctx context.Context, key, value string) error {
 	return nil
 }
 
+// LogAppend writes one pkg/logrecord record -- key must start with
+// logrecord.LogKeyPrefix (typically built via logrecord.BuildKey) and
+// value its encoded pkg/logrecord.Record. Unlike Set, key/value are
+// []byte rather than string: a log record's key is raw binary (a packed
+// length-prefixed kind/unitID plus a binary timestamp and random
+// suffix), not text. See shmevent.EventLogAppend's doc comment for why
+// this needs its own event rather than reusing EventSet.
+func (s *Session) LogAppend(ctx context.Context, key, value []byte) error {
+	payload, err := shmevent.EncodeSetPayload(key, value)
+	if err != nil {
+		return fmt.Errorf("shmclient: log_append: %w", err)
+	}
+	resp, err := ipc.Call(ctx, s.peerID, shmevent.Msg{
+		EventType: shmevent.EventLogAppend,
+		Value:     payload,
+		ID:        newID(),
+	}, s.priv)
+	if err != nil {
+		return fmt.Errorf("shmclient: log_append: %w", err)
+	}
+	if resp.EventType == shmevent.EventError {
+		return fmt.Errorf("shmclient: log_append: %s", resp.Value)
+	}
+	return nil
+}
+
 // Get reads key from the session's node -- a one-shot GetField carrying
 // key directly in Value (SourceID left 0), skipping the registry
 // round-trip Set needs -- which, like any raft follower's local read, may
@@ -262,6 +288,38 @@ func (s *Session) PollExecute(ctx context.Context) (senderPeerID string, payload
 	return string(sender), notifPayload, true, nil
 }
 
+// ListRange returns the first stored key/value pair with start <= key <=
+// end (both inclusive), or ok=false if none remain in that range -- see
+// shmevent.EventListRange's doc comment. A caller wanting every match
+// calls this in a loop, each time narrowing start to just past the
+// previously returned key (e.g. append a 0x00 byte to it), the same
+// "loop rather than a bulk response" shape PollExecute already uses.
+func (s *Session) ListRange(ctx context.Context, start, end []byte) (key, value []byte, ok bool, err error) {
+	query, err := shmevent.EncodeListRangeQuery(start, end)
+	if err != nil {
+		return nil, nil, false, fmt.Errorf("shmclient: list_range: %w", err)
+	}
+	resp, err := ipc.Call(ctx, s.peerID, shmevent.Msg{
+		EventType: shmevent.EventListRange,
+		Value:     query,
+		ID:        newID(),
+	}, s.priv)
+	if err != nil {
+		return nil, nil, false, fmt.Errorf("shmclient: list_range: %w", err)
+	}
+	if resp.EventType == shmevent.EventError {
+		return nil, nil, false, fmt.Errorf("shmclient: list_range: %s", resp.Value)
+	}
+	if len(resp.Value) == 0 {
+		return nil, nil, false, nil
+	}
+	key, value, err = shmevent.DecodeListRangeQuery(resp.Value)
+	if err != nil {
+		return nil, nil, false, fmt.Errorf("shmclient: list_range: decode result: %w", err)
+	}
+	return key, value, true, nil
+}
+
 // GetPublicKey fetches peerID's Ed25519 public key -- unsigned, since it's
 // one of the two bootstrap events a node accepts without a key to check a
 // signature against yet (see pkg/shmevent.RequiresSignature).
@@ -304,6 +362,16 @@ func Set(ctx context.Context, peerID, key, value string) error {
 		return err
 	}
 	return s.Set(ctx, key, value)
+}
+
+// LogAppend is the one-shot convenience wrapper around
+// Open+Session.LogAppend.
+func LogAppend(ctx context.Context, peerID string, key, value []byte) error {
+	s, err := Open(ctx, peerID)
+	if err != nil {
+		return err
+	}
+	return s.LogAppend(ctx, key, value)
 }
 
 // Get is the one-shot convenience wrapper around Open+Session.Get.
@@ -376,4 +444,14 @@ func PollExecute(ctx context.Context, peerID string) (senderPeerID string, paylo
 		return "", nil, false, err
 	}
 	return s.PollExecute(ctx)
+}
+
+// ListRange is the one-shot convenience wrapper around
+// Open+Session.ListRange.
+func ListRange(ctx context.Context, peerID string, start, end []byte) (key, value []byte, ok bool, err error) {
+	s, err := Open(ctx, peerID)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	return s.ListRange(ctx, start, end)
 }

@@ -117,6 +117,26 @@
 # chooses it, it doubles as a stable handle the client can cite later via
 # `sourceId`/`destinationId`.
 #
+# # Range queries: ListRange, and pkg/logrecord's reserved key namespace
+#
+# Every event above addresses exactly one key. ListRange{value:
+# pack(start, end), id} is the one exception: it answers a bounded
+# key-range scan (pkg/store.Store.ScanRange, start/end both inclusive,
+# SQLite's byte-wise BLOB ordering) directly against whichever node
+# receives it -- no raft-leader forwarding, same as GetField, since reads
+# don't need leader routing. There's no bulk response: it returns only
+# the first matching pair still within [start, end], packed the same way
+# as the request (pack(key, value) this time); a caller wanting every
+# match polls it in a loop, narrowing start to just past the previous
+# response's key each time -- the same "loop rather than a bulk/push
+# response" shape PollExecute already uses. pkg/logrecord builds keys
+# this is designed around: a reserved top-level byte (sibling to
+# SystemKeyPrefix above, so an ordinary Set/EventSet can't collide with
+# one by accident) followed by a length-prefixed kind string, a
+# length-prefixed unit-id string, a big-endian nanosecond timestamp, and
+# a random suffix -- see that package's doc comment for the full layout
+# and why each field is ordered/sized the way it is.
+#
 # # Integrity and authenticity
 #
 # `crc32` covers every other field except itself and `signature` (see

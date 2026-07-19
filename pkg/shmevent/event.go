@@ -141,6 +141,40 @@ const (
 	// immediately loses that permission on every node, exactly as
 	// promptly as a confirm grants it.
 	EventPermitRevoke uint8 = 13
+	// EventListRange answers a bounded key range scan against the local
+	// store directly -- pkg/store.Store.ScanRange -- unlike every Set/Get
+	// event, which addresses exactly one key. Value is
+	// EncodeListRangeQuery(start, end) (start/end both inclusive, the same
+	// framing EncodeSetPayload uses since both only ever pack two
+	// length-delimited byte strings). Answered locally by whichever node
+	// receives it -- like EventGetField, it needs no raft-leader
+	// forwarding, since reads don't require leader routing the way writes
+	// do. There is no bulk response: the daemon returns only the first
+	// matching pair still within [start, end] via
+	// EncodeListRangeQuery(key, value) (the identical framing again, just
+	// naming the fields differently since this response packs a result
+	// pair, not a query bound), or an empty Value if none remain. A local
+	// caller wanting every match in the range polls this in a loop, each
+	// time narrowing start to just past the previous response's key --
+	// see pkg/logrecord for the key scheme this is designed around and
+	// EventPollExecute's doc comment for the same "loop rather than a
+	// bulk/push response" reasoning applied here.
+	EventListRange uint8 = 14
+	// EventLogAppend writes one pkg/logrecord record -- a single ordinary
+	// Set/handleSetForward call under the hood (the same raft-replicated
+	// path EventSet uses), except it addresses pkg/logrecord's reserved
+	// LogKeyPrefix namespace, which EventSet/EventSetField deliberately
+	// refuse (see pkg/daemon's rejectReservedKey) so an ordinary caller's
+	// key can never collide with a log record by accident. This event is
+	// that namespace's one legitimate way in -- mirroring how
+	// EventPermitRequest is SystemKeyPrefix's, both bypassing the
+	// generic EventSet/EventSetField rejection by being a different case
+	// entirely, one whose whole job is writing into that specific
+	// reserved space. Value is EncodeSetPayload(key, value) (the same
+	// framing EventSet already uses), and the daemon rejects it if key
+	// doesn't actually start with LogKeyPrefix -- this event isn't a
+	// general-purpose Set bypass, only a log-record one.
+	EventLogAppend uint8 = 15
 	// EventError is response-only: Value carries a UTF-8 error message,
 	// ID echoes the failed request's ID. Not part of the fields the
 	// protocol was specified with -- added because the struct has no
@@ -179,6 +213,10 @@ func EventName(e uint8) string {
 		return "poll_execute"
 	case EventPermitRevoke:
 		return "permit_revoke"
+	case EventListRange:
+		return "list_range"
+	case EventLogAppend:
+		return "log_append"
 	case EventError:
 		return "error"
 	default:
@@ -219,6 +257,10 @@ func EventFromName(name string) (uint8, bool) {
 		return EventPollExecute, true
 	case "permit_revoke":
 		return EventPermitRevoke, true
+	case "list_range":
+		return EventListRange, true
+	case "log_append":
+		return EventLogAppend, true
 	case "error":
 		return EventError, true
 	default:
@@ -281,6 +323,25 @@ func DecodeSetPayload(payload []byte) (key, value []byte, err error) {
 		return nil, nil, fmt.Errorf("shmevent: set payload key length %d exceeds payload size %d", keyLen, len(payload))
 	}
 	return payload[2 : 2+keyLen], payload[2+keyLen:], nil
+}
+
+// EncodeListRangeQuery packs start and end -- both inclusive store key
+// bounds -- into a single EventListRange request Value. Just
+// EncodeSetPayload under a name that reads correctly at an
+// EventListRange call site (see that event's doc comment): the wire
+// framing is identical, since both only ever pack two length-delimited
+// byte strings.
+func EncodeListRangeQuery(start, end []byte) ([]byte, error) {
+	return EncodeSetPayload(start, end)
+}
+
+// DecodeListRangeQuery is the inverse of EncodeListRangeQuery. Also used,
+// under this same name, to decode an EventListRange response's
+// EncodeListRangeQuery(key, value) framing -- see that event's doc
+// comment for why the response reuses this pairing rather than a
+// separately named encoder.
+func DecodeListRangeQuery(payload []byte) (start, end []byte, err error) {
+	return DecodeSetPayload(payload)
 }
 
 // EncodeExecuteNotification packs senderPeerID and payload into a single

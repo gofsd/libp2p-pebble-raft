@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/gofsd/libp2p-kv-raft/pkg/daemon"
+	"github.com/gofsd/libp2p-kv-raft/pkg/logrecord"
 	"github.com/gofsd/libp2p-kv-raft/pkg/registry"
 	"github.com/gofsd/libp2p-kv-raft/pkg/shmclient"
 )
@@ -436,6 +437,96 @@ func PollExecute() (senderPeerID, value string, ok bool, err error) {
 		return "", "", false, fmt.Errorf("poll execute: %w", err)
 	}
 	return sender, string(payload), ok, nil
+}
+
+// LogAppend implements `mage logappend <kind> <unitID> <fieldsJSON>
+// <narrative>`: writes a new pkg/logrecord.Record, timestamped now and
+// attributed to the current node's own peer id, via a single
+// EventLogAppend call -- see pkg/logrecord's doc comment for the key
+// scheme and shmevent.EventLogAppend's for why log records get their own
+// event rather than reusing EventSet.
+func LogAppend(kind, unitID string, fields map[string]string, narrative string) error {
+	reg, err := registry.Open()
+	if err != nil {
+		return err
+	}
+	peerID, err := reg.Current()
+	if err != nil {
+		return err
+	}
+
+	rnd, err := logrecord.NewRand()
+	if err != nil {
+		return fmt.Errorf("log append: %w", err)
+	}
+	ts := time.Now()
+	key, err := logrecord.BuildKey(kind, unitID, ts, rnd)
+	if err != nil {
+		return fmt.Errorf("log append: %w", err)
+	}
+	rec := logrecord.Record{
+		Kind:         kind,
+		UnitID:       unitID,
+		Timestamp:    ts,
+		AuthorPeerID: peerID,
+		Fields:       fields,
+		Narrative:    narrative,
+	}
+	value, err := rec.Encode()
+	if err != nil {
+		return fmt.Errorf("log append: %w", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), ipcTimeout)
+	defer cancel()
+	if err := shmclient.LogAppend(ctx, peerID, key, value); err != nil {
+		return fmt.Errorf("log append: %w", err)
+	}
+	return nil
+}
+
+// LogQuery implements `mage logquery <kind> <unitID> [--since] [--until]
+// [--limit]`: returns every pkg/logrecord.Record of the given kind and
+// unitID with a timestamp in [start, end], oldest first, up to limit
+// records (limit <= 0 means unlimited). Drives pkg/shmevent.EventListRange
+// in a loop (see Session.ListRange's doc comment), narrowing the scan's
+// lower bound to just past each returned key so the next call resumes
+// where the last one left off.
+func LogQuery(kind, unitID string, start, end time.Time, limit int) ([]logrecord.Record, error) {
+	reg, err := registry.Open()
+	if err != nil {
+		return nil, err
+	}
+	peerID, err := reg.Current()
+	if err != nil {
+		return nil, err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), ipcTimeout)
+	defer cancel()
+	sess, err := shmclient.Open(ctx, peerID)
+	if err != nil {
+		return nil, fmt.Errorf("log query: %w", err)
+	}
+
+	lo, hi := logrecord.ScanBounds(kind, unitID, start, end)
+	var records []logrecord.Record
+	for limit <= 0 || len(records) < limit {
+		key, value, ok, err := sess.ListRange(ctx, lo, hi)
+		if err != nil {
+			return nil, fmt.Errorf("log query: %w", err)
+		}
+		if !ok {
+			break
+		}
+		rec, err := logrecord.Decode(value)
+		if err != nil {
+			return nil, fmt.Errorf("log query: decode record: %w", err)
+		}
+		records = append(records, rec)
+		lo = append(append([]byte{}, key...), 0x00)
+	}
+	return records, nil
 }
 
 func ensureDaemonBinary(reg *registry.Registry, repoRoot string) (string, error) {
