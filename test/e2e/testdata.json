@@ -5,19 +5,13 @@
     "3": "0.0.0",
     "4": "0.0.0"
   },
-  "published_version": 3,
+  "published_version": 4,
   "nodes": {
     "1": {
       "platform": "desktop",
       "peer_id": "12D3KooWPzzXQsH6aurbUV8nr9TV6vSj7KvZoY6adxUcDV6PC42C",
       "public_key": "d2bc8886d1ffeff518b789d2e2af2002835291e229f1ee4e59cf9b2b7a26ace9",
       "private_key": "94b073c43b6df4e601403b3a6d19327ac8f6a1f08e54ed5e5f611ed4f758af17d2bc8886d1ffeff518b789d2e2af2002835291e229f1ee4e59cf9b2b7a26ace9"
-    },
-    "2": {
-      "platform": "remote",
-      "peer_id": "12D3KooWGV3TBBvgWnaEDco1bVZcDdZmcPb3V6Q5v97sus6Nqe73",
-      "public_key": "630e9c2e7958e5b9a6dfdad7a6225c0b752cb324e2ab615335a454e3bd94be02",
-      "private_key": "9c6953744c243fd2b4508d11d2b9dd9522226432226ec405629de12d2fa88161630e9c2e7958e5b9a6dfdad7a6225c0b752cb324e2ab615335a454e3bd94be02"
     },
     "3": {
       "platform": "android",
@@ -30,6 +24,12 @@
       "peer_id": "12D3KooWAcpogdcjoCQMcc9zc8jJ3JFwciM95KKeLnFdoGQKvVs6",
       "public_key": "0be6d5ece37777d48f301e8954309fbab721713c638feacb53ce1b9bafce4ed1",
       "private_key": "41790c674ef6c2c07b25fb9fe540c5f3fdc89fba09e02f6317a666b137842ed90be6d5ece37777d48f301e8954309fbab721713c638feacb53ce1b9bafce4ed1"
+    },
+    "5": {
+      "platform": "remote",
+      "peer_id": "12D3KooWN4ytwWy2x1zwqs61HpQPi45RoUW55caAiGUQ2ZxwDBoH",
+      "public_key": "b60ac58cf0fd078f1b283e9380776b9814049e65e98d1627e603d39020b00a04",
+      "private_key": "e6c6f877e54ebef581c1ba34e7ea30d6e28b83f0130d2699fe847bb7280baa0db60ac58cf0fd078f1b283e9380776b9814049e65e98d1627e603d39020b00a04"
     }
   },
   "rows": [
@@ -179,8 +179,7 @@
         "event": "add",
         "value": "BOOTSTRAP"
       },
-      "status": 1,
-      "error": "join: leader rejected join: ERR: not leader"
+      "status": 0
     },
     {
       "version": 4,
@@ -208,8 +207,7 @@
         "source_id": 100,
         "value": "world"
       },
-      "status": 1,
-      "error": "not leader and no leader known"
+      "status": 0
     },
     {
       "version": 4,
@@ -218,8 +216,7 @@
         "event": "get_field",
         "value": "hello"
       },
-      "status": 1,
-      "error": "store: key not found"
+      "status": 0
     },
     {
       "version": 4,
@@ -228,8 +225,8 @@
         "event": "add",
         "value": "BOOTSTRAP"
       },
-      "status": 1,
-      "error": "join: leader rejected join: ERR: leadership lost while committing log"
+      "status": 2,
+      "error": "android e2e skipped: no adb device/emulator connected (see `adb devices` / start an AVD)"
     },
     {
       "version": 4,
@@ -237,7 +234,8 @@
       "event": {
         "event": "get_public_key"
       },
-      "status": 0
+      "status": 2,
+      "error": "android e2e skipped: no adb device/emulator connected (see `adb devices` / start an AVD)"
     },
     {
       "version": 4,
@@ -247,7 +245,8 @@
         "value": "hello-android",
         "id": 200
       },
-      "status": 0
+      "status": 2,
+      "error": "android e2e skipped: no adb device/emulator connected (see `adb devices` / start an AVD)"
     },
     {
       "version": 4,
@@ -257,7 +256,8 @@
         "source_id": 200,
         "value": "world-android"
       },
-      "status": 0
+      "status": 2,
+      "error": "android e2e skipped: no adb device/emulator connected (see `adb devices` / start an AVD)"
     },
     {
       "version": 4,
@@ -266,7 +266,8 @@
         "event": "get_field",
         "value": "hello-android"
       },
-      "status": 0
+      "status": 2,
+      "error": "android e2e skipped: no adb device/emulator connected (see `adb devices` / start an AVD)"
     },
     {
       "version": 4,
@@ -275,8 +276,7 @@
         "event": "add",
         "value": "BOOTSTRAP"
       },
-      "status": 1,
-      "error": "p2p: client add: not leader and no leader known"
+      "status": 0
     },
     {
       "version": 4,
@@ -304,8 +304,7 @@
         "source_id": 300,
         "value": "world-web"
       },
-      "status": 1,
-      "error": "p2p: not leader and no leader known"
+      "status": 0
     },
     {
       "version": 4,
@@ -314,8 +313,7 @@
         "event": "get_field",
         "value": "hello-web"
       },
-      "status": 1,
-      "error": "p2p: key \"hello-web\" not found"
+      "status": 0
     }
   ]
 }
