@@ -259,6 +259,105 @@ func TestResumeNode(t *testing.T) {
 	}
 }
 
+// TestAddNodeWithKeyReusesIdentity drives kvctl.AddNodeWithKey: it creates a
+// node normally (minting a fresh identity), saves a copy of its
+// identity.key, deletes the node entirely, then re-provisions a brand new
+// data directory from that saved key via AddNodeWithKey. The resulting peer
+// id must match the original -- proving the peer id really is derived from
+// (and stable across a fresh import of) the supplied key, the scenario
+// AddNodeWithKey exists for (e.g. restoring a node after its data dir was
+// lost, as long as the key itself was backed up).
+func TestAddNodeWithKeyReusesIdentity(t *testing.T) {
+	root := repoRoot(t)
+	home := t.TempDir()
+	t.Setenv(registry.EnvHome, home)
+
+	reg, err := registry.Open()
+	if err != nil {
+		t.Fatalf("registry.Open: %v", err)
+	}
+	t.Cleanup(func() { killAllRegistered(t, reg) })
+
+	fastRaftArgs := []string{
+		"-raft-heartbeat-timeout", "300ms",
+		"-raft-election-timeout", "300ms",
+		"-raft-leader-lease-timeout", "250ms",
+	}
+
+	originalID, err := kvctl.AddNodeWithArgs(root, fastRaftArgs)
+	if err != nil {
+		t.Fatalf("AddNode: %v", err)
+	}
+	info, ok, err := reg.Get(originalID)
+	if err != nil || !ok {
+		t.Fatalf("registry.Get(%s): ok=%v err=%v", originalID, ok, err)
+	}
+
+	keyBytes, err := os.ReadFile(info.KeyPath)
+	if err != nil {
+		t.Fatalf("read identity.key: %v", err)
+	}
+	savedKeyPath := filepath.Join(t.TempDir(), "saved-identity.key")
+	if err := os.WriteFile(savedKeyPath, keyBytes, 0o600); err != nil {
+		t.Fatalf("save identity.key copy: %v", err)
+	}
+
+	killProcess(t, info.PID)
+	if err := kvctl.DeleteNode(originalID); err != nil {
+		t.Fatalf("DeleteNode: %v", err)
+	}
+
+	restoredID, err := kvctl.AddNodeWithKeyAndArgs(root, savedKeyPath, fastRaftArgs)
+	if err != nil {
+		t.Fatalf("AddNodeWithKey: %v", err)
+	}
+	if restoredID != originalID {
+		t.Fatalf("AddNodeWithKey peer id = %s, want %s (re-imported the same identity)", restoredID, originalID)
+	}
+}
+
+// TestDeleteNode drives kvctl.DeleteNode: it must refuse while the node's
+// daemon is still running, and once stopped must remove both the registry
+// entry and the on-disk data directory.
+func TestDeleteNode(t *testing.T) {
+	root := repoRoot(t)
+	home := t.TempDir()
+	t.Setenv(registry.EnvHome, home)
+
+	reg, err := registry.Open()
+	if err != nil {
+		t.Fatalf("registry.Open: %v", err)
+	}
+	t.Cleanup(func() { killAllRegistered(t, reg) })
+
+	peerID, err := kvctl.AddNode(root)
+	if err != nil {
+		t.Fatalf("AddNode: %v", err)
+	}
+	info, ok, err := reg.Get(peerID)
+	if err != nil || !ok {
+		t.Fatalf("registry.Get(%s): ok=%v err=%v", peerID, ok, err)
+	}
+
+	if err := kvctl.DeleteNode(peerID); err == nil {
+		t.Fatalf("DeleteNode while running: want error, got none")
+	}
+
+	killProcess(t, info.PID)
+
+	if err := kvctl.DeleteNode(peerID); err != nil {
+		t.Fatalf("DeleteNode: %v", err)
+	}
+	if _, ok, err := reg.Get(peerID); err != nil {
+		t.Fatalf("registry.Get after DeleteNode: %v", err)
+	} else if ok {
+		t.Fatalf("registry.Get after DeleteNode: entry still present")
+	}
+	if _, err := os.Stat(info.DataDir); !os.IsNotExist(err) {
+		t.Fatalf("data dir %s still exists after DeleteNode (stat err: %v)", info.DataDir, err)
+	}
+}
+
 // TestRequestConfirmPermitAcrossNodes drives kvctl.RequestPermit/
 // ConfirmPermit (the CLI-facing plumbing behind `mage requestpermit`/
 // `confirmpermit`) end to end through two real spawned nodes and real

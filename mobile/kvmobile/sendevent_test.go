@@ -85,9 +85,9 @@ func TestSendEventAgainstRealDaemon(t *testing.T) {
 	leaderMultiaddr = leaderAddr
 	t.Cleanup(func() {
 		leaderMultiaddr = prevLeader
-		mu.Lock()
-		started, peerID, session = false, "", nil
-		mu.Unlock()
+		if err := Stop(); err != nil {
+			t.Errorf("Stop: %v", err)
+		}
 	})
 
 	if _, err := Start(t.TempDir()); err != nil {

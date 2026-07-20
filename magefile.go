@@ -779,6 +779,38 @@ func runAddNode(peerIDs ...string) error {
 	return nil
 }
 
+// AddNodeWithKey is the AddNode equivalent for provisioning a node under an
+// existing Ed25519 identity (an identity.key file's hex-encoded format --
+// e.g. one saved from a node created elsewhere) instead of generating a
+// fresh one, bootstrapping it as the cluster's sole leader.
+//
+// Usage: mage addnodewithkey <keyFile>
+func AddNodeWithKey(keyFile string) error {
+	return runAddNodeWithKey(keyFile)
+}
+
+// AddFollowerWithKey is the AddFollower equivalent of AddNodeWithKey: joins
+// the cluster led by leaderPeerID under an existing identity instead of
+// generating a fresh one.
+//
+// Usage: mage addfollowerwithkey <keyFile> <leaderPeerID>
+func AddFollowerWithKey(keyFile, leaderPeerID string) error {
+	return runAddNodeWithKey(keyFile, leaderPeerID)
+}
+
+func runAddNodeWithKey(keyFile string, peerIDs ...string) error {
+	root, err := repoRoot()
+	if err != nil {
+		return err
+	}
+	peerID, err := kvctl.AddNodeWithKey(root, keyFile, peerIDs...)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("✅ node %s is up and selected as current\n", peerID)
+	return nil
+}
+
 // Use selects which node Set/Get target, by peer id.
 // Usage: mage use <peerID>
 func Use(peerID string) error {
@@ -786,6 +818,21 @@ func Use(peerID string) error {
 		return err
 	}
 	fmt.Printf("current node set to %s\n", peerID)
+	return nil
+}
+
+// DeleteNode permanently deletes a node's on-disk data (identity, sqlite
+// store, raft log/snapshots) and its registry entry, by peer id. Refuses
+// while the node's daemon process still appears to be running -- stop it
+// first (there is no automatic kill: this mirrors the e2e pipeline's
+// deletenode, which likewise never tears anything down implicitly).
+//
+// Usage: mage deletenode <peerID>
+func DeleteNode(peerID string) error {
+	if err := kvctl.DeleteNode(peerID); err != nil {
+		return err
+	}
+	fmt.Printf("🗑️  node %s deleted\n", peerID)
 	return nil
 }
 

@@ -108,6 +108,56 @@ func addNew(reg *registry.Registry, binPath string, extraDaemonArgs []string, ro
 	return bootUp(reg, binPath, extraDaemonArgs, peerID, dataDir, keyPath, role, leaderPeerID)
 }
 
+// AddNodeWithKey is like AddNode but provisions the new node under the
+// existing Ed25519 identity stored (hex encoded, matching identity.key's
+// format) at srcKeyPath instead of generating a fresh one -- e.g. to
+// restore a node under a peer id other nodes/deployments already know
+// about. It only supports the 0- and 1-arg AddNode shapes (bootstrap as
+// leader, or join as follower under leaderPeerID); the 2-arg
+// restart-under-an-existing-identity shape is what AddNode itself already
+// is for, since that identity is by definition already on disk.
+func AddNodeWithKey(repoRoot, srcKeyPath string, peerIDs ...string) (string, error) {
+	return AddNodeWithKeyAndArgs(repoRoot, srcKeyPath, nil, peerIDs...)
+}
+
+// AddNodeWithKeyAndArgs is AddNodeWithKey plus extraDaemonArgs appended to
+// the spawned kvnode's command line -- the AddNodeWithKey equivalent of
+// AddNodeWithArgs.
+func AddNodeWithKeyAndArgs(repoRoot, srcKeyPath string, extraDaemonArgs []string, peerIDs ...string) (string, error) {
+	reg, err := registry.Open()
+	if err != nil {
+		return "", err
+	}
+	binPath, err := ensureDaemonBinary(reg, repoRoot)
+	if err != nil {
+		return "", err
+	}
+	return addNodeWithKey(reg, binPath, srcKeyPath, extraDaemonArgs, peerIDs...)
+}
+
+func addNodeWithKey(reg *registry.Registry, binPath, srcKeyPath string, extraDaemonArgs []string, peerIDs ...string) (string, error) {
+	switch len(peerIDs) {
+	case 0:
+		return addNewWithKey(reg, binPath, srcKeyPath, extraDaemonArgs, registry.RoleLeader, "")
+	case 1:
+		leaderPeerID := peerIDs[0]
+		if err := checkLeaderReachable(reg, leaderPeerID); err != nil {
+			return "", err
+		}
+		return addNewWithKey(reg, binPath, srcKeyPath, extraDaemonArgs, registry.RoleFollower, leaderPeerID)
+	default:
+		return "", fmt.Errorf("addnodewithkey: expected 0 or 1 arguments (leaderPeerID), got %d", len(peerIDs))
+	}
+}
+
+func addNewWithKey(reg *registry.Registry, binPath, srcKeyPath string, extraDaemonArgs []string, role registry.Role, leaderPeerID string) (string, error) {
+	peerID, dataDir, keyPath, err := importIdentity(reg.NodeDataDir, srcKeyPath)
+	if err != nil {
+		return "", err
+	}
+	return bootUp(reg, binPath, extraDaemonArgs, peerID, dataDir, keyPath, role, leaderPeerID)
+}
+
 func rejoin(reg *registry.Registry, binPath string, extraDaemonArgs []string, leaderPeerID, ownPeerID string) (string, error) {
 	info, ok, err := reg.Get(ownPeerID)
 	if err != nil {
@@ -276,6 +326,34 @@ func Use(peerID string) error {
 		return fmt.Errorf("use: unknown peer id %s (not created on this machine)", peerID)
 	}
 	return reg.SetCurrent(peerID)
+}
+
+// DeleteNode implements `mage deletenode <peerID>`: permanently removes a
+// node's on-disk state (identity key, sqlite store, raft log/snapshots --
+// its whole data directory) and its registry entry. It refuses to do so
+// while the node's daemon process still appears to be running (same
+// liveness check AddNode's rejoin path uses), since deleting files out from
+// under a live process would corrupt them -- stop the node first. If
+// peerID was the "current" Set/Get target, that selection is cleared too.
+func DeleteNode(peerID string) error {
+	reg, err := registry.Open()
+	if err != nil {
+		return err
+	}
+	info, ok, err := reg.Get(peerID)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("deletenode: unknown peer id %s (not created on this machine)", peerID)
+	}
+	if err := ensureNotAlreadyRunning(info); err != nil {
+		return err
+	}
+	if err := os.RemoveAll(info.DataDir); err != nil {
+		return fmt.Errorf("deletenode: remove data dir %s: %w", info.DataDir, err)
+	}
+	return reg.Delete(peerID)
 }
 
 // Set implements `mage set <key> <value>`: applies key=value through raft on

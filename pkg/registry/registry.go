@@ -154,6 +154,29 @@ func (r *Registry) List() ([]NodeInfo, error) {
 	return out, nil
 }
 
+// Delete removes peerID's entry from the registry. If peerID was the
+// current Set/Get target, that selection is cleared too, so a deleted
+// node's peer id doesn't linger as the current target (Current would keep
+// returning it, and every subsequent Set/Get would fail resolving it).
+// Deleting an unknown peerID is a no-op, not an error -- callers that need
+// to distinguish "didn't exist" should check Get first.
+func (r *Registry) Delete(peerID string) error {
+	f, err := r.load()
+	if err != nil {
+		return err
+	}
+	delete(f.Nodes, peerID)
+	if err := r.save(f); err != nil {
+		return err
+	}
+	if cur, err := r.Current(); err == nil && cur == peerID {
+		if err := os.Remove(r.currentPath()); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+	}
+	return nil
+}
+
 // ResolveAddress returns a dialable multiaddr (including /p2p/<peerID>) for
 // peerID, looked up from the local registry. It is used to turn a bare peer
 // id (what a human, or `mage addnode`, provides) into a raft.ServerAddress.

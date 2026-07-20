@@ -118,6 +118,18 @@ a new leader needs to know about it. Note a 2-voter cluster has no fault toleran
 is down for a while, the other cannot commit and eventually can't win an election either;
 bringing the down side back with `resumenode`/`rejoinnode` lets them re-elect on their own.
 
+`mage addnodewithkey <keyFile>` / `mage addfollowerwithkey <keyFile> <leaderAddr>` are the
+`addnode`/`addfollower` equivalents for provisioning a node under a specific, already-known Ed25519
+identity — `<keyFile>` is a file in `identity.key`'s own hex-encoded format (e.g. a backed-up copy
+of a previous node's key) — instead of always minting a fresh one. The resulting peer id is
+whatever that key derives to, not a new random one.
+
+`mage deletenode <peerID>` permanently removes a node's on-disk state (identity key, sqlite store,
+raft log/snapshots — its whole data directory under the registry) and its entry in
+`registry.json`. It refuses while that node's daemon process still appears to be running — stop it
+first — since deleting files out from under a live process would corrupt them; unlike
+`e2e:deletenode`, it never kills anything itself.
+
 ### Follower on Android
 
 The Android app (`android-app/`) runs the same follower daemon in-process via
@@ -145,6 +157,61 @@ The app's UI (`MainActivity`) is a thin wrapper over `Kvmobile.start/submit/get`
 up the daemon and joins the cluster, `submit`/`get` go through the daemon's IPC exactly like the
 desktop CLI, just over the Android shared-memory transport instead of named shared memory. Every
 `submit` is forwarded from this (never-leader) follower to whichever peer is currently leader,
+
+`Kvmobile` runs exactly one daemon per process, so `Start(dataDir)`/`StartWithKey(dataDir, keyHex)`,
+`Stop()`, and `Delete(dataDir)` are the Android equivalents of desktop's `addnode`/`addnodewithkey`/
+`use`/`deletenode`, adapted to that constraint: `StartWithKey` provisions `dataDir`'s identity from
+an existing `identity.key`-format hex string at runtime instead of always minting a fresh one
+(refusing if `dataDir` already holds a *different* identity); `Stop` shuts the current daemon down
+so a different `dataDir`/identity can be started next — there's no multi-node registry to pick a
+"current" one from the way desktop's `mage use <peerID>` does, so switching is just `Stop()` then
+`Start`/`StartWithKey` against the target directory; `Delete` wipes a `dataDir` outright and refuses
+while a daemon is running against it, same safety rule as `mage deletenode`.
+
+`Kvmobile` also binds the permit and direct-notification desktop commands, against whichever
+device is currently running (Start's session, same as Submit/Get): `RequestPermit`/`ConfirmPermit`/
+`RevokePermit(kind, targetPeerID[, metadata])` (`kind` is `"peer"` or `"bootstrap"`, mirroring
+`mage requestpermit`/`confirmpermit`/`revokepermit`) and their `*LogPermit` counterparts for
+`pkg/logrecord` access (`mage requestlogpermit`/`confirmlogpermit`/`revokelogpermit`); `Execute`/
+`PollExecute` for the raft-bypassing peer-to-peer `EventExecute` notification (`mage execute`/
+`pollexecute`) — `PollExecute` returns a JSON envelope (`{"pending":true,"sender_peer_id":"...",
+"value":"..."}` or `{"pending":false}`) since gomobile bindings only support one non-error return
+value, unlike `pkg/kvctl.PollExecute`'s 4-value Go signature. `LogAppend(kind, unitID, fieldsJSON,
+narrative)`/`LogQuery(kind, unitID, since, until, limit)` are the `pkg/logrecord` read/write
+counterparts (`mage logappend`/`logquery`) — `LogQuery` likewise returns a single JSON array string
+(`"[]"` when nothing matches, never `null`) instead of `pkg/kvctl.LogQuery`'s `[]logrecord.Record`.
+
+`WatchExecute(cb ExecuteCallback)`/`StopWatchExecute()` push `EventExecute` notifications to the
+caller instead of requiring a `PollExecute` timer: `ExecuteCallback` is a Go interface Kotlin
+implements (gomobile's reverse-binding direction — the only `kvmobile` API that isn't plain
+string-in/string-out), and `WatchExecute` runs a background loop calling `cb.OnNotification`
+per notification, in delivery order, on its own goroutine (Kotlin implementations must marshal
+back onto the UI thread themselves before touching views). A single registration survives a
+`Stop`/`Start` identity switch with no need to call `WatchExecute` again — the loop just waits
+whenever no daemon is currently running rather than exiting. `PollExecute` still exists for a
+one-shot manual drain; `WatchExecute` is the continuous-delivery alternative, e.g. to drive a
+live "command execution log" view fed by whichever peer is running the command (see that peer's
+own `LogAppend` calls, watched for and re-fetched via `LogQuery` on each poke).
+
+`kvmobile` also has a `Group`/`Command` catalog layer (`catalog.go`), built entirely on
+`LogAppend`/`EventListRange` — no new capnp wire schema: `CreateGroup`/`UpdateGroup`/`DeleteGroup`,
+`GetGroup`/`ListGroups`, and the `Command` counterparts `CreateCommand`/`UpdateCommand`/
+`DeleteCommand`/`GetCommand`/`ListCommands`. Both are `pkg/logrecord.Record` chains — append-only,
+"update" is a fresh revision under the same ID, "delete" a tombstone revision, readers always fold
+down to the latest. A `Command` names a `TargetPeerID` (who executes it) and a `FormSchema` (JSON
+`[]FormField`) describing the inputs its submission form should collect — `kvmobile` only stores
+and discovers a `Command`'s definition, it doesn't interpret or run one.
+
+"Participant of group G" is `IsGroupParticipant(G)`: a confirmed `KindLogPermit` record for
+`logKind = "command:"+G`, the *same* string `G`'s commands are stored under (see `commandLogKind`)
+— granted/revoked via the group-scoped wrappers `RequestGroupParticipation`/
+`ConfirmGroupParticipation`/`RevokeGroupParticipation` (thin wrappers over `*LogPermit`). `Group`
+listing/reading has no participation gate (a public catalog any cluster member may browse or
+propose one into); every `Command` operation, reads included, requires it. This is enforced
+client-side only, inside `kvmobile` itself — nothing in `pkg/daemon` independently blocks a local
+caller from reading/writing its own already-replicated store (`Config.RequirePermitForLog` only
+gates a *different* peer's forwarded request), so it holds only as long as callers go through these
+bindings rather than around them.
 over `pkg/daemon.ForwardProtocolID`. `Kvmobile.sendEvent` (not used by `MainActivity`, only by the
 e2e pipeline's `E2ETest` instrumented test) exposes the same raw `pkg/shmevent` event dispatch
 `submit`/`get` are themselves built on, for tests that need the exact event kvctl-cli's `sendevent`

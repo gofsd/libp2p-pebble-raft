@@ -21,6 +21,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -30,6 +32,7 @@ import (
 	"github.com/gofsd/libp2p-kv-raft/pkg/daemon"
 	"github.com/gofsd/libp2p-kv-raft/pkg/e2edata"
 	"github.com/gofsd/libp2p-kv-raft/pkg/ipc"
+	"github.com/gofsd/libp2p-kv-raft/pkg/logrecord"
 	"github.com/gofsd/libp2p-kv-raft/pkg/shmclient"
 	"github.com/gofsd/libp2p-kv-raft/pkg/shmevent"
 )
@@ -89,11 +92,13 @@ const (
 )
 
 var (
-	mu      sync.Mutex
-	started bool
-	peerID  string
-	runErrC chan error
-	session *shmclient.Session
+	mu         sync.Mutex
+	started    bool
+	peerID     string
+	curDataDir string
+	runErrC    chan error
+	session    *shmclient.Session
+	cancelRun  context.CancelFunc
 )
 
 // Start brings up the follower daemon in-process under dataDir (an
@@ -112,6 +117,28 @@ var (
 // to tell the two cases apart -- see pkg/kvctl's RejoinNode for the same
 // reasoning on desktop.
 func Start(dataDir string) (string, error) {
+	return start(dataDir, ensureIdentity)
+}
+
+// StartWithKey is like Start but provisions dataDir's identity from keyHex
+// (hex-encoded, identity.key's own on-disk format -- e.g. a key file
+// exported from another device, or the string pkg/kvctl.AddNodeWithKey/
+// `mage addnodewithkey` reads from a file on desktop) instead of always
+// falling back to ensureIdentity's persisted-or-generated-or-build-seeded
+// key. This is the runtime equivalent of desktop's AddNodeWithKey/
+// `mage addnodewithkey`, letting the caller pick which identity a data
+// directory comes up as instead of only ever a fresh or build-time one.
+//
+// If dataDir already holds a *different* identity, it refuses rather than
+// silently abandoning that identity's already-replicated raft state --
+// call Delete(dataDir) first if that's really what's wanted.
+func StartWithKey(dataDir, keyHex string) (string, error) {
+	return start(dataDir, func(dataDir string) (keyPath, peerID string, err error) {
+		return importIdentity(dataDir, keyHex)
+	})
+}
+
+func start(dataDir string, resolveIdentity func(dataDir string) (keyPath, peerID string, err error)) (string, error) {
 	mu.Lock()
 	defer mu.Unlock()
 	if started {
@@ -121,15 +148,24 @@ func Start(dataDir string) (string, error) {
 		return "", fmt.Errorf("kvmobile: no leader multiaddr baked in at build time")
 	}
 
-	keyPath, id, err := ensureIdentity(dataDir)
+	keyPath, id, err := resolveIdentity(dataDir)
 	if err != nil {
 		return "", err
 	}
 
-	ctx := context.Background()
-	runErrC = make(chan error, 1)
+	// A stale ready file left behind by an earlier Start/Stop cycle against
+	// this same dataDir would let waitForReady below return early -- before
+	// this run has written its own -- since pkg/daemon.Run's
+	// writeReadyFile only overwrites it once the new daemon is actually
+	// up, not on the way in. Harmless on a dataDir Start has never touched
+	// before; only relevant once Stop() makes restarting the same dataDir
+	// in one process possible.
+	_ = os.Remove(filepath.Join(dataDir, daemon.ReadyFileName))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errC := make(chan error, 1)
 	go func() {
-		runErrC <- daemon.Run(ctx, daemon.Config{
+		errC <- daemon.Run(ctx, daemon.Config{
 			DataDir:            dataDir,
 			KeyPath:            keyPath,
 			RelayPeer:          relayMultiaddr,
@@ -140,36 +176,109 @@ func Start(dataDir string) (string, error) {
 		})
 	}()
 
-	if err := waitForReady(dataDir, runErrC, callTimeout); err != nil {
+	if err := waitForReady(dataDir, errC, callTimeout); err != nil {
+		cancel()
 		return "", fmt.Errorf("kvmobile: start follower: %w", err)
 	}
 
-	addCtx, cancel := context.WithTimeout(ctx, callTimeout)
-	defer cancel()
+	addCtx, addCancel := context.WithTimeout(ctx, callTimeout)
+	defer addCancel()
 	sess, err := shmclient.Open(addCtx, id)
 	if err != nil {
+		cancel()
 		return "", fmt.Errorf("kvmobile: fetch signing key: %w", err)
 	}
 	if _, err := sess.Add(addCtx, leaderMultiaddr); err != nil {
+		cancel()
 		return "", fmt.Errorf("kvmobile: join cluster: %w", err)
 	}
 
 	session = sess
 	peerID = id
+	curDataDir = dataDir
+	runErrC = errC
+	cancelRun = cancel
 	started = true
 	return peerID, nil
+}
+
+// Stop shuts down the currently running in-process daemon, if any, and
+// waits for it to actually release its resources (sqlite/raft files,
+// libp2p host) before returning. kvmobile runs exactly one daemon per
+// process at a time, so this is the enabling step for the same thing
+// desktop's `mage use <peerID>` picks between multiple already-running
+// nodes: to switch to a different identity here, Stop the current one,
+// then Start/StartWithKey against the dataDir for the identity to switch
+// to. Safe to call when nothing is running (a no-op).
+func Stop() error {
+	mu.Lock()
+	if !started {
+		mu.Unlock()
+		return nil
+	}
+	cancel := cancelRun
+	errC := runErrC
+	mu.Unlock()
+
+	cancel()
+	select {
+	case <-errC:
+	case <-time.After(callTimeout):
+		return fmt.Errorf("kvmobile: daemon did not stop within %s", callTimeout)
+	}
+
+	mu.Lock()
+	started = false
+	peerID = ""
+	curDataDir = ""
+	session = nil
+	runErrC = nil
+	cancelRun = nil
+	mu.Unlock()
+	return nil
+}
+
+// Delete permanently removes dataDir's persisted node state (identity key,
+// sqlite store, raft log/snapshots -- the whole directory), mirroring
+// desktop's `mage deletenode`/pkg/kvctl.DeleteNode. It refuses while a
+// daemon is currently running against that same dataDir -- call Stop
+// first -- since removing files out from under a live process would
+// corrupt them.
+func Delete(dataDir string) error {
+	mu.Lock()
+	running := started && curDataDir == dataDir
+	mu.Unlock()
+	if running {
+		return fmt.Errorf("kvmobile: node at %s is currently running; call Stop first", dataDir)
+	}
+	if err := os.RemoveAll(dataDir); err != nil {
+		return fmt.Errorf("kvmobile: delete %s: %w", dataDir, err)
+	}
+	return nil
+}
+
+// currentSession returns the *shmclient.Session for the currently running
+// daemon, or an error if Start/StartWithKey hasn't completed successfully
+// yet -- the shared guard every call that needs a live daemon (Submit,
+// Get, the permit/execute bindings below) starts with.
+func currentSession() (*shmclient.Session, error) {
+	mu.Lock()
+	sess := session
+	ok := started
+	mu.Unlock()
+	if !ok {
+		return nil, fmt.Errorf("kvmobile: Start has not completed successfully yet")
+	}
+	return sess, nil
 }
 
 // Submit sets key=value through raft, forwarding to the current leader if
 // this device isn't it (see pkg/daemon's ForwardProtocolID) -- which, as a
 // follower, it never is, so every Submit takes that path.
 func Submit(key, value string) error {
-	mu.Lock()
-	sess := session
-	ok := started
-	mu.Unlock()
-	if !ok {
-		return fmt.Errorf("kvmobile: Start has not completed successfully yet")
+	sess, err := currentSession()
+	if err != nil {
+		return err
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), callTimeout)
@@ -184,12 +293,9 @@ func Submit(key, value string) error {
 // like any raft follower's local read, may lag a moment behind a Submit
 // that just committed on the leader).
 func Get(key string) (string, error) {
-	mu.Lock()
-	sess := session
-	ok := started
-	mu.Unlock()
-	if !ok {
-		return "", fmt.Errorf("kvmobile: Start has not completed successfully yet")
+	sess, err := currentSession()
+	if err != nil {
+		return "", err
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), callTimeout)
@@ -207,6 +313,425 @@ func PeerID() string {
 	mu.Lock()
 	defer mu.Unlock()
 	return peerID
+}
+
+// permitKindFromName converts kind ("peer" or "bootstrap") to
+// shmevent.KindPermitPeer/KindBootstrapNode -- the same mapping desktop's
+// `mage requestpermit`/`confirmpermit`/`revokepermit` apply via
+// shmevent.KindFromName before reaching pkg/kvctl.
+func permitKindFromName(kind string) (byte, error) {
+	k, ok := shmevent.KindFromName(kind)
+	if !ok {
+		return 0, fmt.Errorf("kvmobile: unknown permit kind %q (want \"peer\" or \"bootstrap\")", kind)
+	}
+	return k, nil
+}
+
+// RequestPermit lodges a pending permit record for targetPeerID (kind is
+// "peer" or "bootstrap") on this device, forwarded to the leader like any
+// other Set -- see shmevent.EventPermitRequest's doc comment. Any raft
+// node may originate one, so this needs no special standing of its own.
+// metadata may be "" (only meaningful for kind "bootstrap": the dialable
+// multiaddr being vouched for).
+func RequestPermit(kind, targetPeerID, metadata string) error {
+	sess, err := currentSession()
+	if err != nil {
+		return err
+	}
+	k, err := permitKindFromName(kind)
+	if err != nil {
+		return err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), callTimeout)
+	defer cancel()
+	if err := sess.RequestPermit(ctx, k, []byte(targetPeerID), []byte(metadata)); err != nil {
+		return fmt.Errorf("kvmobile: request permit: %w", err)
+	}
+	return nil
+}
+
+// ConfirmPermit promotes a pending permit record for targetPeerID to
+// confirmed. Only takes effect if this device is itself a raft voter --
+// see shmevent.EventPermitConfirm's doc comment.
+func ConfirmPermit(kind, targetPeerID string) error {
+	sess, err := currentSession()
+	if err != nil {
+		return err
+	}
+	k, err := permitKindFromName(kind)
+	if err != nil {
+		return err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), callTimeout)
+	defer cancel()
+	if err := sess.ConfirmPermit(ctx, k, []byte(targetPeerID)); err != nil {
+		return fmt.Errorf("kvmobile: confirm permit: %w", err)
+	}
+	return nil
+}
+
+// RevokePermit deletes a confirmed permit record for targetPeerID
+// outright. Only takes effect if this device is itself a raft voter --
+// see shmevent.EventPermitRevoke's doc comment.
+func RevokePermit(kind, targetPeerID string) error {
+	sess, err := currentSession()
+	if err != nil {
+		return err
+	}
+	k, err := permitKindFromName(kind)
+	if err != nil {
+		return err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), callTimeout)
+	defer cancel()
+	if err := sess.RevokePermit(ctx, k, []byte(targetPeerID)); err != nil {
+		return fmt.Errorf("kvmobile: revoke permit: %w", err)
+	}
+	return nil
+}
+
+// RequestLogPermit lodges a pending permission for targetPeerID to
+// append/query pkg/logrecord records of logKind, forwarded to the leader
+// like any other Set -- see shmevent.EventLogPermitRequest's doc comment.
+// metadata may be "".
+func RequestLogPermit(logKind, targetPeerID, metadata string) error {
+	sess, err := currentSession()
+	if err != nil {
+		return err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), callTimeout)
+	defer cancel()
+	if err := sess.RequestLogPermit(ctx, logKind, []byte(targetPeerID), []byte(metadata)); err != nil {
+		return fmt.Errorf("kvmobile: request log permit: %w", err)
+	}
+	return nil
+}
+
+// ConfirmLogPermit promotes a pending log-kind permit record for
+// targetPeerID to confirmed. Only takes effect if this device is itself a
+// raft voter -- see shmevent.EventLogPermitConfirm's doc comment.
+func ConfirmLogPermit(logKind, targetPeerID string) error {
+	sess, err := currentSession()
+	if err != nil {
+		return err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), callTimeout)
+	defer cancel()
+	if err := sess.ConfirmLogPermit(ctx, logKind, []byte(targetPeerID)); err != nil {
+		return fmt.Errorf("kvmobile: confirm log permit: %w", err)
+	}
+	return nil
+}
+
+// RevokeLogPermit deletes a confirmed log-kind permit record for
+// targetPeerID outright. Only takes effect if this device is itself a raft
+// voter -- see shmevent.EventLogPermitRevoke's doc comment.
+func RevokeLogPermit(logKind, targetPeerID string) error {
+	sess, err := currentSession()
+	if err != nil {
+		return err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), callTimeout)
+	defer cancel()
+	if err := sess.RevokeLogPermit(ctx, logKind, []byte(targetPeerID)); err != nil {
+		return fmt.Errorf("kvmobile: revoke log permit: %w", err)
+	}
+	return nil
+}
+
+// LogAppend writes a new pkg/logrecord.Record of the given kind/unitID,
+// timestamped now and attributed to this device's own peer id -- the
+// mobile equivalent of `mage logappend <kind> <unitID> <fieldsJSON>
+// <narrative>`/pkg/kvctl.LogAppend. kind and unitID are entirely
+// caller-chosen strings, not a fixed set -- see pkg/logrecord's doc
+// comment for the generic key/record scheme this builds on. fieldsJSON is
+// a JSON object of string fields, or "" for none.
+func LogAppend(kind, unitID, fieldsJSON, narrative string) error {
+	sess, err := currentSession()
+	if err != nil {
+		return err
+	}
+
+	var fields map[string]string
+	if fieldsJSON != "" {
+		if err := json.Unmarshal([]byte(fieldsJSON), &fields); err != nil {
+			return fmt.Errorf("kvmobile: decode fieldsJSON: %w", err)
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), callTimeout)
+	defer cancel()
+	if err := appendRecord(ctx, sess, kind, unitID, fields, narrative); err != nil {
+		return fmt.Errorf("kvmobile: log append: %w", err)
+	}
+	return nil
+}
+
+// LogQuery lists every pkg/logrecord.Record of the given kind/unitID whose
+// timestamp falls in [since, until], oldest first, up to limit records --
+// the mobile equivalent of `mage logquery <kind> <unitID> <since|"">
+// <until|""> <limit|"">`/pkg/kvctl.LogQuery. since/until are RFC3339 or ""
+// (since "" = unbounded, until "" = now); limit is a count or "" (no
+// limit). The result is a JSON array of records, e.g. `[{"kind":"...",
+// "unit_id":"...","timestamp":"...","author_peer_id":"...","narrative":
+// "..."}]` -- gomobile bindings only support one non-error return value,
+// so this returns the whole array as one string rather than
+// pkg/kvctl.LogQuery's []logrecord.Record.
+func LogQuery(kind, unitID, since, until, limit string) (string, error) {
+	sess, err := currentSession()
+	if err != nil {
+		return "", err
+	}
+
+	start := time.Unix(0, 0)
+	if since != "" {
+		t, err := time.Parse(time.RFC3339, since)
+		if err != nil {
+			return "", fmt.Errorf("kvmobile: since: %w", err)
+		}
+		start = t
+	}
+	end := time.Now()
+	if until != "" {
+		t, err := time.Parse(time.RFC3339, until)
+		if err != nil {
+			return "", fmt.Errorf("kvmobile: until: %w", err)
+		}
+		end = t
+	}
+	n := 0
+	if limit != "" {
+		v, err := strconv.Atoi(limit)
+		if err != nil {
+			return "", fmt.Errorf("kvmobile: limit: %w", err)
+		}
+		n = v
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), callTimeout)
+	defer cancel()
+
+	lo, hi := logrecord.ScanBounds(kind, unitID, start, end)
+	records := []logrecord.Record{}
+	for n <= 0 || len(records) < n {
+		key, value, ok, err := sess.ListRange(ctx, lo, hi)
+		if err != nil {
+			return "", fmt.Errorf("kvmobile: log query: %w", err)
+		}
+		if !ok {
+			break
+		}
+		rec, err := logrecord.Decode(value)
+		if err != nil {
+			return "", fmt.Errorf("kvmobile: log query: decode record: %w", err)
+		}
+		records = append(records, rec)
+		lo = append(append([]byte{}, key...), 0x00)
+	}
+
+	out, err := json.Marshal(records)
+	if err != nil {
+		return "", fmt.Errorf("kvmobile: encode log query result: %w", err)
+	}
+	return string(out), nil
+}
+
+// Execute sends value as a direct peer-to-peer EventExecute notification
+// from this device to destPeerID, bypassing raft and the store entirely --
+// see shmevent.EventExecute's doc comment.
+func Execute(destPeerID, value string) error {
+	sess, err := currentSession()
+	if err != nil {
+		return err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), callTimeout)
+	defer cancel()
+	if err := sess.Execute(ctx, destPeerID, []byte(value)); err != nil {
+		return fmt.Errorf("kvmobile: execute: %w", err)
+	}
+	return nil
+}
+
+// pollExecuteResult is PollExecute's JSON return shape -- gomobile
+// bindings only support one non-error return value, so this mirrors
+// SendEvent's own JSON-envelope convention rather than
+// pkg/kvctl.PollExecute's 4-value Go signature.
+type pollExecuteResult struct {
+	Pending      bool   `json:"pending"`
+	SenderPeerID string `json:"sender_peer_id,omitempty"`
+	Value        string `json:"value,omitempty"`
+}
+
+// PollExecute drains one queued EventExecute notification delivered to
+// this device, if any -- see shmevent.EventPollExecute's doc comment. The
+// result is JSON encoded, e.g. `{"pending":true,"sender_peer_id":"...",
+// "value":"..."}`, or `{"pending":false}` if nothing was queued.
+func PollExecute() (string, error) {
+	sess, err := currentSession()
+	if err != nil {
+		return "", err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), callTimeout)
+	defer cancel()
+	sender, payload, ok, err := sess.PollExecute(ctx)
+	if err != nil {
+		return "", fmt.Errorf("kvmobile: poll execute: %w", err)
+	}
+
+	out, err := json.Marshal(pollExecuteResult{
+		Pending:      ok,
+		SenderPeerID: sender,
+		Value:        string(payload),
+	})
+	if err != nil {
+		return "", fmt.Errorf("kvmobile: encode poll execute result: %w", err)
+	}
+	return string(out), nil
+}
+
+// ExecuteCallback is a gomobile-bindable interface Kotlin implements to
+// receive WatchExecute's push notifications -- this package's first use of
+// gomobile's reverse-binding pattern (a Go interface Kotlin implements,
+// with Go calling into it), unlike every other kvmobile function's plain
+// string-in/string-out shape.
+type ExecuteCallback interface {
+	// OnNotification is called once per EventExecute notification drained
+	// from this device's own queue, in delivery order, on a goroutine
+	// WatchExecute owns -- never the caller's own thread. gomobile's
+	// generated Kotlin binding already hops this call onto a JNI-managed
+	// thread, but the implementation is still responsible for its own
+	// thread-safety (e.g. runOnUiThread before touching views).
+	OnNotification(senderPeerID, value string)
+}
+
+// watchExecutePollInterval bounds how long runExecuteWatch sleeps after
+// finding nothing queued (or no daemon currently running) before checking
+// again. PollExecute is a local, in-memory, non-blocking check (see
+// executeInbox's doc comment in pkg/daemon), not a store read, so this can
+// be short without meaningful cost -- unlike a LogQuery-based poll loop,
+// which would mean a real replicated-store read every tick.
+const watchExecutePollInterval = 200 * time.Millisecond
+
+// watchExecutePollCallTimeout bounds each individual PollExecute call
+// runExecuteWatch makes -- deliberately much shorter than callTimeout
+// (which exists for genuinely slow cross-cluster operations like a
+// forwarded Set/Get awaiting a leader election). PollExecute never leaves
+// this device, so under normal operation it returns almost immediately;
+// the only time this bound actually matters is a call that's in flight
+// exactly when Stop() tears down the daemon out from under it, which
+// would otherwise leave the watch loop stuck for the rest of a full
+// callTimeout before it notices the session is gone and can resume
+// waiting for the next Start.
+const watchExecutePollCallTimeout = 2 * time.Second
+
+var (
+	watchMu     sync.Mutex
+	watchCancel context.CancelFunc
+	watchDone   chan struct{}
+)
+
+// WatchExecute starts a background loop that drains this device's
+// EventExecute queue (see PollExecute) and invokes cb.OnNotification for
+// each notification, in delivery order, until StopWatchExecute is called.
+// Calling WatchExecute again replaces any previously running watcher
+// (stopping and waiting for it first) rather than running two at once.
+//
+// If no daemon is currently running -- before the first Start, or between
+// a Stop and the next Start/StartWithKey -- the loop just keeps checking
+// rather than exiting, so a single WatchExecute registration survives a
+// Stop/Start identity switch with no need to re-register.
+func WatchExecute(cb ExecuteCallback) error {
+	if cb == nil {
+		return fmt.Errorf("kvmobile: WatchExecute: cb must not be nil")
+	}
+
+	watchMu.Lock()
+	defer watchMu.Unlock()
+
+	stopWatchExecuteLocked()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	watchCancel = cancel
+	watchDone = done
+
+	go runExecuteWatch(ctx, done, cb)
+	return nil
+}
+
+// StopWatchExecute stops a running WatchExecute loop, if any, and waits
+// for it to actually exit before returning. Safe to call when nothing is
+// running (a no-op).
+func StopWatchExecute() {
+	watchMu.Lock()
+	defer watchMu.Unlock()
+	stopWatchExecuteLocked()
+}
+
+// stopWatchExecuteLocked requires watchMu already held.
+func stopWatchExecuteLocked() {
+	if watchCancel == nil {
+		return
+	}
+	watchCancel()
+	<-watchDone
+	watchCancel = nil
+	watchDone = nil
+}
+
+// runExecuteWatch is WatchExecute's background loop body. It always
+// terminates by closing done, whether via ctx cancellation (the normal
+// StopWatchExecute/replaced-by-a-new-WatchExecute path) or, in principle,
+// never on its own -- there's no other exit.
+func runExecuteWatch(ctx context.Context, done chan struct{}, cb ExecuteCallback) {
+	defer close(done)
+
+	wait := func() (stop bool) {
+		select {
+		case <-ctx.Done():
+			return true
+		case <-time.After(watchExecutePollInterval):
+			return false
+		}
+	}
+
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+
+		sess, err := currentSession()
+		if err != nil {
+			// No daemon running right now -- keep waiting rather than
+			// exiting, so a later Start/StartWithKey picks this watcher
+			// back up with no action needed from the caller.
+			if wait() {
+				return
+			}
+			continue
+		}
+
+		pollCtx, cancel := context.WithTimeout(ctx, watchExecutePollCallTimeout)
+		sender, payload, ok, err := sess.PollExecute(pollCtx)
+		cancel()
+		if err != nil || !ok {
+			if wait() {
+				return
+			}
+			continue
+		}
+
+		cb.OnNotification(sender, string(payload))
+		// Loop again immediately (no wait) to drain any backlog quickly.
+	}
 }
 
 // SendEvent sends one raw pkg/shmevent event to this device's own
@@ -297,19 +822,7 @@ func ensureIdentity(dataDir string) (keyPath, peerID string, err error) {
 	}
 	keyPath = filepath.Join(dataDir, "identity.key")
 
-	if data, err := os.ReadFile(keyPath); err == nil {
-		raw, err := hex.DecodeString(string(data))
-		if err != nil {
-			return "", "", fmt.Errorf("kvmobile: decode key file %s: %w", keyPath, err)
-		}
-		priv, err := crypto.UnmarshalPrivateKey(raw)
-		if err != nil {
-			return "", "", fmt.Errorf("kvmobile: unmarshal key file %s: %w", keyPath, err)
-		}
-		pid, err := peer.IDFromPrivateKey(priv)
-		if err != nil {
-			return "", "", fmt.Errorf("kvmobile: derive peer id: %w", err)
-		}
+	if pid, err := readIdentityFile(keyPath); err == nil {
 		return keyPath, pid.String(), nil
 	}
 
@@ -329,6 +842,66 @@ func ensureIdentity(dataDir string) (keyPath, peerID string, err error) {
 		return "", "", fmt.Errorf("kvmobile: write key file: %w", err)
 	}
 	return keyPath, pid.String(), nil
+}
+
+// importIdentity persists keyHex (hex-encoded, identity.key's own format)
+// as dataDir's identity, the same on-disk shape ensureIdentity itself
+// writes, so a later plain Start against the same dataDir picks it back up
+// unchanged. If dataDir already holds a *different* identity, it refuses
+// rather than silently abandoning that identity's already-replicated raft
+// state -- see StartWithKey's doc comment.
+func importIdentity(dataDir, keyHex string) (keyPath, peerID string, err error) {
+	raw, err := hex.DecodeString(strings.TrimSpace(keyHex))
+	if err != nil {
+		return "", "", fmt.Errorf("kvmobile: decode key: %w", err)
+	}
+	priv, err := crypto.UnmarshalPrivateKey(raw)
+	if err != nil {
+		return "", "", fmt.Errorf("kvmobile: unmarshal key: %w", err)
+	}
+	pid, err := peer.IDFromPrivateKey(priv)
+	if err != nil {
+		return "", "", fmt.Errorf("kvmobile: derive peer id: %w", err)
+	}
+
+	if err := os.MkdirAll(dataDir, 0o755); err != nil {
+		return "", "", fmt.Errorf("kvmobile: create data dir: %w", err)
+	}
+	keyPath = filepath.Join(dataDir, "identity.key")
+	if existingPid, err := readIdentityFile(keyPath); err == nil {
+		if existingPid != pid {
+			return "", "", fmt.Errorf("kvmobile: %s already holds a different identity (%s); call Delete(%s) first", dataDir, existingPid, dataDir)
+		}
+		return keyPath, pid.String(), nil
+	}
+
+	if err := os.WriteFile(keyPath, []byte(hex.EncodeToString(raw)), 0o600); err != nil {
+		return "", "", fmt.Errorf("kvmobile: write key file: %w", err)
+	}
+	return keyPath, pid.String(), nil
+}
+
+// readIdentityFile loads and decodes the identity persisted at keyPath, if
+// any -- the shared read side of ensureIdentity/importIdentity's
+// hex-encoded-marshaled-key format.
+func readIdentityFile(keyPath string) (peer.ID, error) {
+	data, err := os.ReadFile(keyPath)
+	if err != nil {
+		return "", err
+	}
+	raw, err := hex.DecodeString(string(data))
+	if err != nil {
+		return "", fmt.Errorf("kvmobile: decode key file %s: %w", keyPath, err)
+	}
+	priv, err := crypto.UnmarshalPrivateKey(raw)
+	if err != nil {
+		return "", fmt.Errorf("kvmobile: unmarshal key file %s: %w", keyPath, err)
+	}
+	pid, err := peer.IDFromPrivateKey(priv)
+	if err != nil {
+		return "", fmt.Errorf("kvmobile: derive peer id: %w", err)
+	}
+	return pid, nil
 }
 
 // generateOrSeededKeyPair returns a deterministic key derived from

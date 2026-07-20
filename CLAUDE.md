@@ -33,9 +33,12 @@ full walkthrough):
 ```bash
 mage addnode                                    # bootstrap a new leader
 mage addfollower "<multiaddr>"                  # join an existing leader
+mage addnodewithkey <keyFile>                    # bootstrap a new leader under an existing identity
+mage addfollowerwithkey <keyFile> "<multiaddr>"  # join an existing leader under an existing identity
 mage resumenode <peerID>                        # restart a node from persisted raft state
 mage rejoinnode <leaderAddr> <peerID>            # restart + re-send the join request
 mage use <peerID>                                # select the active node for set/get
+mage deletenode <peerID>                         # permanently delete a (stopped) node's data + registry entry
 mage set <key> <value>
 mage get <key>
 ```
