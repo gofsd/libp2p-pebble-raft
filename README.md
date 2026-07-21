@@ -130,6 +130,18 @@ raft log/snapshots — its whole data directory under the registry) and its entr
 first — since deleting files out from under a live process would corrupt them; unlike
 `e2e:deletenode`, it never kills anything itself.
 
+`mage listclusters` lists every raft cluster known to this machine's registry, grouped by
+whichever peer id originally bootstrapped it (`registry.NodeInfo.ClusterPeerID` if a node joined
+elsewhere, otherwise its own peer id) — a pure local read, no daemon needs to be running, but for
+the same reason it only ever shows clusters this machine has itself created or joined a node into,
+never a network-wide view. `mage listnodes <peerID>` instead queries that *already-running* node
+for its raft cluster's full **live** membership — every current voter/learner/leader, including
+peers this machine never created and so has no registry entry for at all — read from that node's
+own locally-replicated `shmevent.KindClusterMember` records (kept current by every member whenever
+a peer joins/leaves or its own leadership status changes). Both are also exposed on `kvctl-cli`
+(`listclusters` / `listnodes <peerID>`), printing one JSON object per line the same way `logquery`
+does.
+
 #### Changing which cluster a node belongs to: `join`/`leave`/`rm`
 
 `addnode`/`addfollower` above always mint a *new* identity. `mage join <targetPeerID>` instead
@@ -214,6 +226,14 @@ cluster. `Rm()` does everything `Leave` does, plus revokes this device's `cluste
 if the leader requires one) and deletes the joined cluster's local data subdirectory specifically
 — never the identity key at `dataDir` itself, same distinction desktop's `mage rm` draws against
 `mage deletenode`.
+
+`ListClusters()` and `ListClusterMembers()` are the Android counterparts of desktop's
+`listclusters`/`listnodes`, adapted to `Kvmobile` running exactly one daemon at a time:
+`ListClusters()` returns a JSON array with 0 or 1 entries — whichever cluster, if any, this device
+is currently joined to — since unlike desktop's `registry.json` there's no persistent history of
+every cluster this identity has ever joined to enumerate; `ListClusterMembers()` needs no peer-id
+argument (there's only ever one running daemon to ask) and returns that one cluster's full live
+membership the same way desktop's `listnodes` does.
 
 `Kvmobile` also binds the permit and direct-notification desktop commands, against whichever
 device is currently running (Start's session, same as Submit/Get): `RequestPermit`/`ConfirmPermit`/
