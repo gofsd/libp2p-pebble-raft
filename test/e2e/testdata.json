@@ -41,7 +41,7 @@
         "value": "BOOTSTRAP"
       },
       "status": 1,
-      "error": "join: leader rejected join: ERR: leadership lost while committing log"
+      "error": "join: leader rejected join: ERR: not leader"
     },
     {
       "version": 1,
@@ -69,7 +69,8 @@
         "source_id": 100,
         "value": "world"
       },
-      "status": 0
+      "status": 1,
+      "error": "leadership lost while committing log"
     },
     {
       "version": 1,
@@ -87,7 +88,8 @@
         "event": "add",
         "value": "BOOTSTRAP"
       },
-      "status": 0
+      "status": 2,
+      "error": "android e2e skipped: no adb device/emulator connected (see `adb devices` / start an AVD)"
     },
     {
       "version": 2,
@@ -95,7 +97,8 @@
       "event": {
         "event": "get_public_key"
       },
-      "status": 0
+      "status": 2,
+      "error": "android e2e skipped: no adb device/emulator connected (see `adb devices` / start an AVD)"
     },
     {
       "version": 2,
@@ -105,7 +108,8 @@
         "value": "hello-android",
         "id": 200
       },
-      "status": 0
+      "status": 2,
+      "error": "android e2e skipped: no adb device/emulator connected (see `adb devices` / start an AVD)"
     },
     {
       "version": 2,
@@ -115,7 +119,8 @@
         "source_id": 200,
         "value": "world-android"
       },
-      "status": 0
+      "status": 2,
+      "error": "android e2e skipped: no adb device/emulator connected (see `adb devices` / start an AVD)"
     },
     {
       "version": 2,
@@ -124,7 +129,8 @@
         "event": "get_field",
         "value": "hello-android"
       },
-      "status": 0
+      "status": 2,
+      "error": "android e2e skipped: no adb device/emulator connected (see `adb devices` / start an AVD)"
     },
     {
       "version": 3,
@@ -133,7 +139,8 @@
         "event": "add",
         "value": "BOOTSTRAP"
       },
-      "status": 0
+      "status": 1,
+      "error": "p2p: client add: not leader and no leader known"
     },
     {
       "version": 3,
@@ -161,7 +168,8 @@
         "source_id": 300,
         "value": "world-web"
       },
-      "status": 0
+      "status": 1,
+      "error": "p2p: not leader and no leader known"
     },
     {
       "version": 3,
@@ -170,7 +178,8 @@
         "event": "get_field",
         "value": "hello-web"
       },
-      "status": 0
+      "status": 1,
+      "error": "p2p: key \"hello-web\" not found"
     },
     {
       "version": 4,
@@ -179,7 +188,8 @@
         "event": "add",
         "value": "BOOTSTRAP"
       },
-      "status": 0
+      "status": 1,
+      "error": "join: leader rejected join: ERR: not leader; current leader is  (already forwarded once)"
     },
     {
       "version": 4,
@@ -276,7 +286,8 @@
         "event": "add",
         "value": "BOOTSTRAP"
       },
-      "status": 0
+      "status": 1,
+      "error": "p2p: client add: not leader and no leader known"
     },
     {
       "version": 4,
@@ -304,7 +315,8 @@
         "source_id": 300,
         "value": "world-web"
       },
-      "status": 0
+      "status": 1,
+      "error": "p2p: not leader and no leader known"
     },
     {
       "version": 4,
@@ -313,7 +325,8 @@
         "event": "get_field",
         "value": "hello-web"
       },
-      "status": 0
+      "status": 1,
+      "error": "p2p: key \"hello-web\" not found"
     }
   ]
 }
