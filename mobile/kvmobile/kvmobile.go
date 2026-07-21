@@ -94,19 +94,22 @@ const (
 
 var (
 	mu sync.Mutex
-	// started, peerID, curDataDir, curDataDirRoot, session, runErrC,
-	// cancelRun track the single in-process daemon this package runs at a
-	// time. curDataDir is the cluster-paired subdirectory of
+	// started, peerID, curDataDir, curDataDirRoot, curClusterID, session,
+	// runErrC, cancelRun track the single in-process daemon this package
+	// runs at a time. curDataDir is the cluster-paired subdirectory of
 	// curDataDirRoot (the dataDir a caller passed to Start/StartWithKey)
 	// that actually holds the sqlite/raft state -- identity.key lives at
 	// curDataDirRoot itself (see ensureIdentity/importIdentity) -- see
 	// registry.ClusterDirName. Delete compares against curDataDirRoot
 	// since that's the directory callers pass in, not the computed
-	// subdirectory.
+	// subdirectory. curClusterID is the peer id of whoever leads the
+	// cluster this device is currently joined to (see startAgainst) --
+	// tracked purely so ListClusters has something to report.
 	started        bool
 	peerID         string
 	curDataDir     string
 	curDataDirRoot string
+	curClusterID   string
 	runErrC        chan error
 	session        *shmclient.Session
 	cancelRun      context.CancelFunc
@@ -234,6 +237,7 @@ func startAgainst(dataDirRoot, leaderAddr string, resolveIdentity func(dataDir s
 	peerID = id
 	curDataDir = clusterDir
 	curDataDirRoot = dataDirRoot
+	curClusterID = remotePID
 	runErrC = errC
 	cancelRun = cancel
 	started = true
@@ -322,6 +326,7 @@ func Stop() error {
 	peerID = ""
 	curDataDir = ""
 	curDataDirRoot = ""
+	curClusterID = ""
 	session = nil
 	runErrC = nil
 	cancelRun = nil
