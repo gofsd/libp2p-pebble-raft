@@ -205,6 +205,23 @@ const (
 	// reused as-is). Once revoked, peerID immediately loses access to
 	// logKind under Config.RequirePermitForLog on every node.
 	EventLogPermitRevoke uint8 = 18
+	// EventLeave asks the raft cluster this node currently belongs to to
+	// remove it (raft.RemoveServer) -- the graceful counterpart to
+	// EventAdd's join: unlike EventAdd, which can name any leader/cluster
+	// to join, EventLeave takes no Value at all, since there's only ever
+	// one cluster this node's own live raft handle currently belongs to.
+	// It shrinks the remote cluster's member count but never tears it
+	// down -- the remaining voters keep operating normally, the same
+	// fault tolerance hashicorp/raft already provides for any minority of
+	// members going offline. Applied directly if this node is the
+	// leader, or forwarded one hop to whoever is (see
+	// pkg/daemon.ForwardLeaveProtocolID) -- mirroring
+	// EventPermitConfirm/EventPermitRevoke's forwarding shape, since a
+	// leaving node -- unlike a brand new joiner -- is already a member
+	// with its own live raft handle and leader-tracking. Local-only: a
+	// remote (ClientProtocolID) caller has no legitimate use for it,
+	// since only this node's own operator decides to leave.
+	EventLeave uint8 = 19
 	// EventError is response-only: Value carries a UTF-8 error message,
 	// ID echoes the failed request's ID. Not part of the fields the
 	// protocol was specified with -- added because the struct has no
@@ -253,6 +270,8 @@ func EventName(e uint8) string {
 		return "log_permit_confirm"
 	case EventLogPermitRevoke:
 		return "log_permit_revoke"
+	case EventLeave:
+		return "leave"
 	case EventError:
 		return "error"
 	default:
@@ -303,6 +322,8 @@ func EventFromName(name string) (uint8, bool) {
 		return EventLogPermitConfirm, true
 	case "log_permit_revoke":
 		return EventLogPermitRevoke, true
+	case "leave":
+		return EventLeave, true
 	case "error":
 		return EventError, true
 	default:

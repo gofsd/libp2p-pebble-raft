@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"time"
 
 	"github.com/gofsd/libp2p-kv-raft/pkg/daemon"
@@ -214,6 +215,15 @@ func rejoin(reg *registry.Registry, binPath string, extraDaemonArgs []string, le
 	dataDir := info.DataDir
 	if info.ClusterPeerID != remotePID {
 		dataDir = reg.ClusterDataDir(ownPeerID, remotePID)
+		// Switching to a cluster this identity has never joined before
+		// means this directory may not exist yet -- unlike info.DataDir
+		// above, which always does (it's this identity's own, already
+		// provisioned by generateIdentity/importIdentity). spawnDaemon
+		// itself doesn't create it (only the identity-provisioning path
+		// does), so a first-time switch needs it created here first.
+		if err := os.MkdirAll(dataDir, 0o755); err != nil {
+			return "", fmt.Errorf("addnode: create cluster data dir %s: %w", dataDir, err)
+		}
 	}
 
 	return bootUp(reg, binPath, extraDaemonArgs, ownPeerID, dataDir, info.KeyPath, info.Role, leaderPeerID)
@@ -357,8 +367,21 @@ func bootUp(reg *registry.Registry, binPath string, extraDaemonArgs []string, pe
 
 	ctx, cancel := context.WithTimeout(context.Background(), ipcTimeout)
 	defer cancel()
-	if _, err := shmclient.Add(ctx, peerID, leaderPeerID); err != nil {
+	status, err := shmclient.Add(ctx, peerID, leaderPeerID)
+	if err != nil {
 		return "", fmt.Errorf("addnode: bootstrap request to %s: %w", peerID, err)
+	}
+	// status is "<peerID> ok" or "<peerID> pending" for the join path (see
+	// pkg/daemon's handleAdd) -- bootstrap/learner-join return the bare
+	// peer id instead, implying "ok". A join request that lands on a
+	// leader with Config.RequireConfirmForJoin set only lodges a pending
+	// shmevent.KindClusterJoin record; it isn't actually admitted onto
+	// the raft configuration until a separate raft voter confirms it (see
+	// applyConfirm's KindClusterJoin handling) -- surface that here
+	// rather than silently reporting success as if it were a normal,
+	// immediately-admitted join.
+	if strings.HasSuffix(status, " pending") {
+		fmt.Printf("addnode: %s: join request lodged, awaiting confirmation from a raft voter (mage confirmpermit cluster-join %s)\n", peerID, peerID)
 	}
 
 	if err := reg.SetCurrent(peerID); err != nil {

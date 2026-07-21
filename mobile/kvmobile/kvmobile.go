@@ -285,6 +285,67 @@ func Delete(dataDir string) error {
 	return nil
 }
 
+// Leave asks the raft cluster this device is currently joined to, to
+// remove it (raft.RemoveServer -- see shmevent.EventLeave's doc comment: a
+// graceful shrink, the remaining voters keep operating normally), then
+// stops the daemon. Unlike desktop's pkg/kvctl.Leave, there is no solo/
+// default cluster to fall back to here -- kvmobile's daemon always joins
+// leaderMultiaddr, baked in at build time (see this package's doc
+// comment) -- so a later Start/StartWithKey would simply attempt to
+// rejoin the very same cluster. Call Rm instead if that later rejoin
+// attempt should require fresh confirmation rather than being silently
+// re-admitted.
+func Leave() error {
+	sess, err := currentSession()
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), callTimeout)
+	defer cancel()
+	if err := sess.Leave(ctx); err != nil {
+		return fmt.Errorf("kvmobile: leave: %w", err)
+	}
+	return Stop()
+}
+
+// Rm does everything Leave does, plus revokes this device's peer id's
+// cluster-join standing (shmevent.KindClusterJoin) so a later
+// Start/StartWithKey attempt against the same cluster starts genuinely
+// pending again -- not silently re-admitted by a stale confirmed record
+// -- and deletes the joined cluster's local data subdirectory. Unlike
+// Delete, it never touches dataDirRoot itself (where identity.key lives):
+// mirrors desktop's pkg/kvctl.Rm, which likewise only ever wipes the
+// composite cluster dir, never the solo identity dir.
+func Rm() error {
+	mu.Lock()
+	ownPeerID := peerID
+	clusterDir := curDataDir
+	mu.Unlock()
+	if ownPeerID == "" {
+		return fmt.Errorf("kvmobile: not currently running")
+	}
+
+	sess, err := currentSession()
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), callTimeout)
+	defer cancel()
+	if err := sess.RevokePermit(ctx, shmevent.KindClusterJoin, []byte(ownPeerID)); err != nil {
+		return fmt.Errorf("kvmobile: rm: revoke cluster-join standing: %w", err)
+	}
+	if err := sess.Leave(ctx); err != nil {
+		return fmt.Errorf("kvmobile: rm: %w", err)
+	}
+	if err := Stop(); err != nil {
+		return err
+	}
+	if err := os.RemoveAll(clusterDir); err != nil {
+		return fmt.Errorf("kvmobile: rm: remove cluster data dir %s: %w", clusterDir, err)
+	}
+	return nil
+}
+
 // currentSession returns the *shmclient.Session for the currently running
 // daemon, or an error if Start/StartWithKey hasn't completed successfully
 // yet -- the shared guard every call that needs a live daemon (Submit,

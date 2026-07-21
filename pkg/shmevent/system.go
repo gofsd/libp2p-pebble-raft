@@ -39,6 +39,19 @@ const (
 	// (pkg/daemon's handleConfirmForward et al.) both key off
 	// SystemKeyPrefix, and this record needs both.
 	KindLogPermit byte = 0x04
+	// KindClusterJoin consumes the 0x05 slot this block's own doc comment
+	// reserved for exactly this: a raft voter/learner add, built on the
+	// same EventPermitRequest/EventPermitConfirm/EventPermitRevoke
+	// pending->confirmed lifecycle as KindPermitPeer, rather than a new
+	// wire protocol. metadata (see EncodeClusterJoinMetadata) carries the
+	// joining peer's dialable multiaddr and requested suffrage; a
+	// confirm promotes the pending record to confirmed exactly like any
+	// other kind, but pkg/daemon's applyConfirm additionally special-
+	// cases this one kind to actually call raft.AddVoter/AddNonvoter at
+	// that moment (see applyConfirm's doc comment) -- everywhere else in
+	// this package and pkg/kvfsm, KindClusterJoin is opaque, handled
+	// identically to any other kind.
+	KindClusterJoin byte = 0x05
 )
 
 // KindName returns a human-readable name for k, for CLI use (mage/
@@ -52,6 +65,8 @@ func KindName(k byte) string {
 		return "bootstrap"
 	case KindClusterMember:
 		return "cluster-member"
+	case KindClusterJoin:
+		return "cluster-join"
 	default:
 		return fmt.Sprintf("unknown(%d)", k)
 	}
@@ -59,7 +74,7 @@ func KindName(k byte) string {
 
 // KindFromName is the inverse of KindName: it returns the kind byte for
 // one of the names KindName produces ("peer", "bootstrap",
-// "cluster-member"), and false if name isn't recognized.
+// "cluster-member", "cluster-join"), and false if name isn't recognized.
 func KindFromName(name string) (byte, bool) {
 	switch name {
 	case "peer":
@@ -68,6 +83,8 @@ func KindFromName(name string) (byte, bool) {
 		return KindBootstrapNode, true
 	case "cluster-member":
 		return KindClusterMember, true
+	case "cluster-join":
+		return KindClusterJoin, true
 	default:
 		return 0, false
 	}
@@ -87,6 +104,36 @@ const (
 	StatusPending   byte = 0x01
 	StatusConfirmed byte = 0x02
 )
+
+// Suffrage bytes -- the raft membership shape a KindClusterJoin request
+// asks for, packed into EncodeClusterJoinMetadata's payload. Mirrors
+// pkg/daemon's parseJoinRequest "voter"/"learner" wire tokens (raft.Voter/
+// raft.Nonvoter) in a form this package can encode without importing
+// hashicorp/raft.
+const (
+	SuffrageVoter   byte = 0x01
+	SuffrageLearner byte = 0x02
+)
+
+// EncodeClusterJoinMetadata packs a joining peer's dialable multiaddr and
+// requested suffrage into the metadata argument EventPermitRequest expects
+// (see EncodePermitRequestPayload) for a KindClusterJoin request: suffrage
+// byte first (fixed size), then addr verbatim as the rest of the buffer --
+// no length prefix needed since addr is always last.
+func EncodeClusterJoinMetadata(addr string, suffrage byte) []byte {
+	buf := make([]byte, 1+len(addr))
+	buf[0] = suffrage
+	copy(buf[1:], addr)
+	return buf
+}
+
+// DecodeClusterJoinMetadata is the inverse of EncodeClusterJoinMetadata.
+func DecodeClusterJoinMetadata(payload []byte) (addr string, suffrage byte, err error) {
+	if len(payload) < 1 {
+		return "", 0, fmt.Errorf("shmevent: cluster join metadata too short: %d bytes", len(payload))
+	}
+	return string(payload[1:]), payload[0], nil
+}
 
 // SystemKey builds the pkg/store key for a system record:
 // SystemKeyPrefix, kind, status, then peerID verbatim. peerID is always

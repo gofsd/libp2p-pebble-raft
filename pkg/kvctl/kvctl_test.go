@@ -441,3 +441,161 @@ func TestRequestConfirmPermitAcrossNodes(t *testing.T) {
 		t.Fatalf("GetFrom(follower, confirmedKey) after ConfirmPermit: %v", lastErr)
 	}
 }
+
+// TestJoinConfirmLeaveRejoinRm drives kvctl.Join/Leave/Rm end to end
+// through two real spawned nodes, with the leader's -require-confirm-for-join
+// flag on -- the CLI-facing path behind `mage join/leave/rejoinnode/rm`. It
+// walks the whole cluster-membership lifecycle: a solo identity joins the
+// leader's cluster (pending until confirmed), gets confirmed, replicates
+// data, leaves gracefully (the leader's cluster keeps its own data intact
+// and the joiner resumes its own solo db), rejoins the same cluster
+// (reusing the composite dir Leave left on disk), and finally Rm's out of
+// it -- proving the composite dir is gone and a further join attempt
+// needs a *fresh* confirmation, not one silently reused from before.
+func TestJoinConfirmLeaveRejoinRm(t *testing.T) {
+	root := repoRoot(t)
+	home := t.TempDir()
+	t.Setenv(registry.EnvHome, home)
+
+	reg, err := registry.Open()
+	if err != nil {
+		t.Fatalf("registry.Open: %v", err)
+	}
+	t.Cleanup(func() { killAllRegistered(t, reg) })
+
+	fastRaftArgs := []string{
+		"-raft-heartbeat-timeout", "300ms",
+		"-raft-election-timeout", "300ms",
+		"-raft-leader-lease-timeout", "250ms",
+	}
+	gatedArgs := append(append([]string{}, fastRaftArgs...), "-require-confirm-for-join")
+
+	leaderID, err := kvctl.AddNodeWithArgs(root, gatedArgs)
+	if err != nil {
+		t.Fatalf("AddNode (leader): %v", err)
+	}
+	joinerID, err := kvctl.AddNodeWithArgs(root, fastRaftArgs)
+	if err != nil {
+		t.Fatalf("AddNode (joiner, solo): %v", err)
+	}
+
+	memberKey := string(shmevent.ClusterMemberKey([]byte(joinerID)))
+
+	waitFor := func(cond func() bool, what string) {
+		t.Helper()
+		deadline := time.Now().Add(10 * time.Second)
+		for time.Now().Before(deadline) {
+			if cond() {
+				return
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+		t.Fatalf("timed out waiting for: %s", what)
+	}
+	isClusterMember := func() bool {
+		_, err := kvctl.GetFrom(leaderID, memberKey)
+		return err == nil
+	}
+
+	// --- join (pending until confirmed) ---
+	if err := kvctl.Use(joinerID); err != nil {
+		t.Fatalf("Use(joiner): %v", err)
+	}
+	returned, err := kvctl.Join(root, leaderID)
+	if err != nil {
+		t.Fatalf("Join: %v", err)
+	}
+	if returned != joinerID {
+		t.Fatalf("Join returned %q, want %q", returned, joinerID)
+	}
+	if isClusterMember() {
+		t.Fatal("joiner already a cluster member before confirmation")
+	}
+
+	// --- confirm (from the leader, itself a real voter) ---
+	if err := kvctl.Use(leaderID); err != nil {
+		t.Fatalf("Use(leader): %v", err)
+	}
+	if err := kvctl.ConfirmPermit(shmevent.KindClusterJoin, []byte(joinerID)); err != nil {
+		t.Fatalf("ConfirmPermit(cluster-join): %v", err)
+	}
+	waitFor(isClusterMember, "joiner admitted as cluster member")
+
+	// --- data replicates once admitted ---
+	if err := kvctl.Set("foo", "bar"); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	waitFor(func() bool {
+		got, err := kvctl.GetFrom(joinerID, "foo")
+		return err == nil && got == "bar"
+	}, "joiner replicated foo=bar")
+
+	// --- leave: graceful shrink, joiner resumes its own solo db ---
+	if err := kvctl.Leave(root, joinerID); err != nil {
+		t.Fatalf("Leave: %v", err)
+	}
+	info, ok, err := reg.Get(joinerID)
+	if err != nil || !ok {
+		t.Fatalf("registry.Get(joiner) after Leave: ok=%v err=%v", ok, err)
+	}
+	if info.ClusterPeerID != "" {
+		t.Fatalf("joiner still shows ClusterPeerID=%q after Leave", info.ClusterPeerID)
+	}
+	if info.DataDir != reg.NodeDataDir(joinerID) {
+		t.Fatalf("joiner DataDir = %s after Leave, want its solo dir %s", info.DataDir, reg.NodeDataDir(joinerID))
+	}
+	if isClusterMember() {
+		t.Fatal("joiner still a cluster member after Leave")
+	}
+
+	// --- rejoin: same cluster, composite dir preserved, needs a fresh
+	// confirmation again since Leave's RemoveServer already dropped it
+	// from the raft configuration ---
+	if err := kvctl.Use(joinerID); err != nil {
+		t.Fatalf("Use(joiner) before rejoin: %v", err)
+	}
+	if _, err := kvctl.Join(root, leaderID); err != nil {
+		t.Fatalf("Join (rejoin after Leave): %v", err)
+	}
+	if isClusterMember() {
+		t.Fatal("joiner auto-admitted on rejoin without a fresh confirmation")
+	}
+	if err := kvctl.Use(leaderID); err != nil {
+		t.Fatalf("Use(leader) for rejoin confirm: %v", err)
+	}
+	if err := kvctl.ConfirmPermit(shmevent.KindClusterJoin, []byte(joinerID)); err != nil {
+		t.Fatalf("ConfirmPermit(cluster-join) on rejoin: %v", err)
+	}
+	waitFor(isClusterMember, "joiner re-admitted as cluster member after rejoin")
+
+	// --- rm: leave + revoke standing + wipe the composite dir ---
+	if err := kvctl.Rm(root, joinerID); err != nil {
+		t.Fatalf("Rm: %v", err)
+	}
+	info2, ok2, err := reg.Get(joinerID)
+	if err != nil || !ok2 {
+		t.Fatalf("registry.Get(joiner) after Rm: ok=%v err=%v", ok2, err)
+	}
+	if info2.ClusterPeerID != "" {
+		t.Fatalf("joiner still shows ClusterPeerID=%q after Rm", info2.ClusterPeerID)
+	}
+	compositeDir := reg.ClusterDataDir(joinerID, leaderID)
+	if _, err := os.Stat(compositeDir); !os.IsNotExist(err) {
+		t.Fatalf("composite dir %s still exists after Rm (stat err: %v)", compositeDir, err)
+	}
+	if isClusterMember() {
+		t.Fatal("joiner still a cluster member after Rm")
+	}
+
+	// --- a further join attempt must require confirmation again, not be
+	// silently re-admitted by any standing left over from before ---
+	if err := kvctl.Use(joinerID); err != nil {
+		t.Fatalf("Use(joiner) after Rm: %v", err)
+	}
+	if _, err := kvctl.Join(root, leaderID); err != nil {
+		t.Fatalf("Join (after Rm): %v", err)
+	}
+	if isClusterMember() {
+		t.Fatal("joiner auto-admitted after Rm -- confirmation should be required again")
+	}
+}

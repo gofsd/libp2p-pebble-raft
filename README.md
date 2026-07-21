@@ -130,6 +130,42 @@ raft log/snapshots — its whole data directory under the registry) and its entr
 first — since deleting files out from under a live process would corrupt them; unlike
 `e2e:deletenode`, it never kills anything itself.
 
+#### Changing which cluster a node belongs to: `join`/`leave`/`rm`
+
+`addnode`/`addfollower` above always mint a *new* identity. `mage join <targetPeerID>` instead
+lets the *current* node (`mage use`) — already running its own default, solo single-node cluster
+— join a different cluster under that same identity, switching its active data directory to
+`<own-peer-id>-<target-peer-id>` (stopping and restarting the local daemon process as needed; the
+same directory-naming scheme `rejoinnode` already uses for an existing identity). Whether this is
+admitted immediately or requires a separate approval step depends entirely on the target
+daemon's own `-require-confirm-for-join` flag (`Config.RequireConfirmForJoin`, default off):
+
+```bash
+mage join <targetPeerID>                    # ask targetPeerID's cluster to admit the current node
+mage confirmpermit cluster-join <peerID>    # (only if the target requires it) admit a pending join
+```
+
+With `-require-confirm-for-join` unset, `join` behaves exactly like `addfollower` under an existing
+identity — immediate `raft.AddVoter`/`AddNonvoter`, no separate step. With it set, a join request
+only lodges a pending `shmevent.KindClusterJoin` record (the same pending/confirmed system-record
+machinery `requestpermit`/`confirmpermit` already use, just a different `kind`); the joining node
+is *not* yet a raft member. **Any current raft voter — not just the leader** — can then run `mage
+confirmpermit cluster-join <peerID>` against that cluster to actually admit it; `mage
+revokepermit cluster-join <peerID>` deletes a still-pending or already-confirmed record outright
+(same voter-only restriction as every other permit kind).
+
+`mage leave <peerID>` asks that cluster to remove peerID via `raft.RemoveServer` — a graceful
+shrink; the remaining voters keep operating normally, exactly like hashicorp/raft already
+tolerates any minority of members going offline — then restarts peerID's daemon back on its own
+default solo data directory. The composite cluster directory is left on disk untouched, so a
+later `join`/`rejoinnode` back to the same cluster picks its local state back up.
+
+`mage rm <peerID>` does everything `leave` does, plus revokes peerID's `cluster-join` standing
+with that cluster (so a *later* `join` attempt against it starts genuinely pending again, not
+auto-admitted by a stale confirmed record) and deletes the composite cluster directory outright —
+`deletenode`'s counterpart for "leave a cluster and don't keep its local data around", as opposed
+to `deletenode`'s "erase this identity entirely."
+
 ### Follower on Android
 
 The Android app (`android-app/`) runs the same follower daemon in-process via
@@ -167,6 +203,17 @@ so a different `dataDir`/identity can be started next — there's no multi-node 
 "current" one from the way desktop's `mage use <peerID>` does, so switching is just `Stop()` then
 `Start`/`StartWithKey` against the target directory; `Delete` wipes a `dataDir` outright and refuses
 while a daemon is running against it, same safety rule as `mage deletenode`.
+
+`Leave()` asks the cluster the currently-running device is joined to to remove it
+(`raft.RemoveServer` — a graceful shrink, the remaining voters keep operating normally) and then
+stops the daemon, mirroring desktop's `mage leave`. Unlike desktop, there's no solo/default
+cluster to fall back to afterward — `kvmobile`'s daemon always joins the build-time-baked-in
+`leaderMultiaddr` — so a subsequent `Start`/`StartWithKey` just attempts to rejoin the very same
+cluster. `Rm()` does everything `Leave` does, plus revokes this device's `cluster-join` standing
+(so that later rejoin attempt needs a fresh confirmation rather than being silently re-admitted,
+if the leader requires one) and deletes the joined cluster's local data subdirectory specifically
+— never the identity key at `dataDir` itself, same distinction desktop's `mage rm` draws against
+`mage deletenode`.
 
 `Kvmobile` also binds the permit and direct-notification desktop commands, against whichever
 device is currently running (Start's session, same as Submit/Get): `RequestPermit`/`ConfirmPermit`/

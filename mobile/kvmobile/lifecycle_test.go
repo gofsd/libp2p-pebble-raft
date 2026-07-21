@@ -1,6 +1,7 @@
 package kvmobile
 
 import (
+	"context"
 	"encoding/hex"
 	"os"
 	"path/filepath"
@@ -9,6 +10,8 @@ import (
 	lp2pcrypto "github.com/libp2p/go-libp2p/core/crypto"
 
 	"github.com/gofsd/libp2p-kv-raft/pkg/e2edata"
+	"github.com/gofsd/libp2p-kv-raft/pkg/registry"
+	"github.com/gofsd/libp2p-kv-raft/pkg/shmclient"
 	"github.com/gofsd/libp2p-kv-raft/pkg/shmevent"
 )
 
@@ -121,11 +124,12 @@ func TestStartWithKeyDerivesGivenIdentity(t *testing.T) {
 // Each Start joins its leader as a full raft voter (see CLAUDE.md's "Node
 // connectivity policy" / README's 2-voter-cluster note), so this uses two
 // independent leaders rather than reusing one across both Starts: killing
-// the first follower via Stop (no graceful RemoveServer/leave) would
-// otherwise strand that leader's cluster at 1-alive-of-2-voters -- unable
-// to commit the second join's own AddVoter -- which is a real, documented
-// limitation of a 2-voter raft cluster, not something Stop/Start can or
-// should paper over.
+// the first follower via Stop -- not Leave, which performs a graceful
+// raft.RemoveServer first, see TestLeaveShrinksClusterAndStops below --
+// would otherwise strand that leader's cluster at 1-alive-of-2-voters --
+// unable to commit the second join's own AddVoter -- which is a real,
+// documented limitation of a 2-voter raft cluster, not something
+// Stop/Start can or should paper over.
 func TestStopThenStartSwitchesIdentity(t *testing.T) {
 	firstLeaderAddr := spawnTestLeader(t, t.TempDir())
 	secondLeaderAddr := spawnTestLeader(t, t.TempDir())
@@ -195,5 +199,93 @@ func TestDeleteRefusesWhileRunning(t *testing.T) {
 	}
 	if _, err := os.Stat(dir); !os.IsNotExist(err) {
 		t.Fatalf("dataDir %s still exists after Delete (stat err: %v)", dir, err)
+	}
+}
+
+// TestLeaveShrinksClusterAndStops drives Leave against a real (in-process)
+// leader: it must actually remove this device from the leader's raft
+// configuration (raft.RemoveServer, not just stop the local daemon) and
+// then stop it, mirroring desktop's pkg/kvctl.Leave -- see that package's
+// own TestJoinConfirmLeaveRejoinRm for the fuller lifecycle this only
+// needs to prove once here, since the underlying shmevent.EventLeave
+// mechanics are already covered end to end in pkg/daemon.
+func TestLeaveShrinksClusterAndStops(t *testing.T) {
+	leaderAddr := spawnTestLeader(t, t.TempDir())
+	leaderPeerID, err := registry.ExtractPeerID(leaderAddr)
+	if err != nil {
+		t.Fatalf("ExtractPeerID: %v", err)
+	}
+
+	prevLeader := leaderMultiaddr
+	leaderMultiaddr = leaderAddr
+	t.Cleanup(func() {
+		leaderMultiaddr = prevLeader
+		_ = Stop()
+	})
+
+	id, err := Start(t.TempDir())
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	ctx := context.Background()
+	memberKey := string(shmevent.ClusterMemberKey([]byte(id)))
+	if _, err := shmclient.Get(ctx, leaderPeerID, memberKey); err != nil {
+		t.Fatalf("follower not a cluster member after Start: %v", err)
+	}
+
+	if err := Leave(); err != nil {
+		t.Fatalf("Leave: %v", err)
+	}
+	if got := PeerID(); got != "" {
+		t.Fatalf("PeerID() after Leave = %s, want \"\" (daemon should be stopped)", got)
+	}
+	if _, err := shmclient.Get(ctx, leaderPeerID, memberKey); err == nil {
+		t.Fatalf("follower still a cluster member after Leave")
+	}
+}
+
+// TestRmDeletesClusterDirAndStops drives Rm: everything
+// TestLeaveShrinksClusterAndStops proves, plus the joined cluster's local
+// data subdirectory must actually be gone afterward -- mirroring
+// desktop's pkg/kvctl.Rm.
+func TestRmDeletesClusterDirAndStops(t *testing.T) {
+	leaderAddr := spawnTestLeader(t, t.TempDir())
+	leaderPeerID, err := registry.ExtractPeerID(leaderAddr)
+	if err != nil {
+		t.Fatalf("ExtractPeerID: %v", err)
+	}
+
+	prevLeader := leaderMultiaddr
+	leaderMultiaddr = leaderAddr
+	t.Cleanup(func() {
+		leaderMultiaddr = prevLeader
+		_ = Stop()
+	})
+
+	dataDirRoot := t.TempDir()
+	id, err := Start(dataDirRoot)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	clusterDir := filepath.Join(dataDirRoot, registry.ClusterDirName(id, leaderPeerID))
+	if _, err := os.Stat(clusterDir); err != nil {
+		t.Fatalf("cluster dir %s missing after Start: %v", clusterDir, err)
+	}
+
+	if err := Rm(); err != nil {
+		t.Fatalf("Rm: %v", err)
+	}
+	if got := PeerID(); got != "" {
+		t.Fatalf("PeerID() after Rm = %s, want \"\"", got)
+	}
+	if _, err := os.Stat(clusterDir); !os.IsNotExist(err) {
+		t.Fatalf("cluster dir %s still exists after Rm (stat err: %v)", clusterDir, err)
+	}
+
+	ctx := context.Background()
+	memberKey := string(shmevent.ClusterMemberKey([]byte(id)))
+	if _, err := shmclient.Get(ctx, leaderPeerID, memberKey); err == nil {
+		t.Fatalf("follower still a cluster member after Rm")
 	}
 }

@@ -43,6 +43,29 @@ mage set <key> <value>
 mage get <key>
 ```
 
+Cluster-membership lifecycle targets (wrap `pkg/kvctl/cluster.go`; let the *current* node -- `mage use` --
+change which cluster it belongs to, rather than spawning a new identity the way `addnode`/`addfollower`
+do):
+
+```bash
+mage join <targetPeerID>   # ask targetPeerID's cluster to admit the current node's own identity
+mage leave <peerID>        # gracefully RemoveServer out of peerID's cluster; resumes its own solo db
+mage rm <peerID>           # leave + revoke cluster-join standing + delete the composite cluster data dir
+```
+
+`join` reuses `addfollower`'s/`rejoinnode`'s existing wire protocol as-is: whether it's admitted
+immediately or first requires a separate confirmation from a raft voter depends entirely on the
+target daemon's own `-require-confirm-for-join` setting (`Config.RequireConfirmForJoin`) -- when
+set, a join request only lodges a pending `shmevent.KindClusterJoin` record, and `mage
+confirmpermit cluster-join <peerID>`, run on any current raft voter (including the leader), is what
+actually admits it (`raft.AddVoter`/`AddNonvoter`). `leave`/`rm` shrink the remote cluster
+gracefully (`raft.RemoveServer`) -- the remaining voters keep operating normally -- and are the
+first commands in this project with any teardown-side raft membership change at all. `leave`
+preserves the composite cluster data dir on disk (so a later `join`/`rejoinnode` back to the same
+cluster picks its local state back up); `rm` deletes it and also revokes standing via the same
+`cluster-join` permit kind, so a later `join` attempt starts genuinely pending again rather than
+being silently re-admitted.
+
 Catalog/dispatch targets (wrap `pkg/kvctl/catalog.go`+`dispatch.go`, the `mage`-side mirror of
 `mobile/kvmobile`'s Group/Command/execution layer — see README's `kvmobile` section for the
 concepts, since the two are otherwise identical):

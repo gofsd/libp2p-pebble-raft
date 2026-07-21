@@ -148,6 +148,24 @@ func (s *Session) Add(ctx context.Context, leaderPeerID string) (string, error) 
 	return string(resp.Value), nil
 }
 
+// Leave asks the raft cluster the session's node currently belongs to to
+// remove it (raft.RemoveServer) -- see shmevent.EventLeave's doc comment.
+// Unlike Add, it takes no target: there's only ever one cluster this
+// node's own live raft handle currently belongs to.
+func (s *Session) Leave(ctx context.Context) error {
+	resp, err := ipc.Call(ctx, s.peerID, shmevent.Msg{
+		EventType: shmevent.EventLeave,
+		ID:        newID(),
+	}, s.priv)
+	if err != nil {
+		return fmt.Errorf("shmclient: leave: %w", err)
+	}
+	if resp.EventType == shmevent.EventError {
+		return fmt.Errorf("shmclient: leave: %s", resp.Value)
+	}
+	return nil
+}
+
 // RequestPermit lodges a pending permit request for peerID (of the given
 // kind -- shmevent.KindPermitPeer or shmevent.KindBootstrapNode) on the
 // session's node. metadata is opaque, kind-specific data (e.g. a dialable
@@ -464,6 +482,15 @@ func Add(ctx context.Context, peerID, leaderPeerID string) (string, error) {
 		return "", err
 	}
 	return s.Add(ctx, leaderPeerID)
+}
+
+// Leave is the one-shot convenience wrapper around Open+Session.Leave.
+func Leave(ctx context.Context, peerID string) error {
+	s, err := Open(ctx, peerID)
+	if err != nil {
+		return err
+	}
+	return s.Leave(ctx)
 }
 
 // RequestPermit is the one-shot convenience wrapper around

@@ -79,6 +79,21 @@ const ForwardConfirmProtocolID = protocol.ID("/libp2p-kv-raft/forward-confirm/1.
 // it actually tries.
 const ForwardJoinProtocolID = protocol.ID("/libp2p-kv-raft/forward-join/1.0.0")
 
+// ForwardLeaveProtocolID is the libp2p protocol a raft member that isn't
+// currently the leader uses to ask the leader to remove it from the raft
+// configuration (raft.RemoveServer) -- see leaveCluster/removeServerLine.
+// Unlike ForwardJoinProtocolID (a stranger asking to be let in), there's
+// no public-facing, non-member-only counterpart: only an existing member
+// -- already reachable through the cluster's own transport, with its own
+// live raft handle and leader-tracking -- ever needs to leave, so it can
+// always determine and dial the current leader itself (see
+// resolveWriteTarget) rather than needing an arbitrary node to introduce
+// it the way a brand new joiner does. The peer to remove is never a
+// payload field: it's whichever peer's libp2p-authenticated connection
+// identity opened the stream (see handleForwardLeaveStream) -- a member
+// can only ever ask to remove itself.
+const ForwardLeaveProtocolID = protocol.ID("/libp2p-kv-raft/forward-leave/1.0.0")
+
 // ClientProtocolID is the libp2p protocol a remote client with no local
 // pkg/ipc channel of its own speaks directly to any cluster node to issue
 // Add/Set/Get requests -- namely the browser build in web-app/ (rust-libp2p
@@ -248,6 +263,24 @@ type Config struct {
 	// RequestLogPermit+ConfirmLogPermit for every (peer, kind) pair a
 	// remote caller needs.
 	RequirePermitForLog bool
+
+	// RequireConfirmForJoin gates JoinProtocolID/ForwardJoinProtocolID
+	// (handleJoinStream/handleForwardJoinStream) on a two-stage
+	// request/confirm workflow instead of today's immediate
+	// raft.AddVoter/AddNonvoter: when true, a join request only lodges a
+	// pending shmevent.KindClusterJoin system record (replying "PENDING"
+	// instead of "OK") and addServerLine only actually runs once a
+	// separate confirmed raft voter promotes that record via
+	// EventPermitConfirm -- see applyConfirm's KindClusterJoin handling.
+	// Defaults to false: today's behavior, where any join request that
+	// reaches the leader (directly or forwarded) is admitted immediately
+	// with no separate approval step. Turning this on requires an
+	// operator on some other already-confirmed voter to run
+	// ConfirmPermit(kind="cluster-join", peerID) -- mage
+	// confirmpermit/kvctl-cli confirmpermit -- for every new node that
+	// wants to join, the same way RequirePermitForRemote/RequirePermitForRelay
+	// require RequestPermit+ConfirmPermit for their own respective kinds.
+	RequireConfirmForJoin bool
 }
 
 // Node is a running daemon instance. Its raft/transport fields are nil
@@ -479,6 +512,7 @@ func start(cfg Config) (*Node, error) {
 	h.SetStreamHandler(ForwardConfirmProtocolID, n.handleForwardConfirmStream)
 	h.SetStreamHandler(ExecuteProtocolID, n.handleExecuteStream)
 	h.SetStreamHandler(ForwardJoinProtocolID, n.handleForwardJoinStream)
+	h.SetStreamHandler(ForwardLeaveProtocolID, n.handleForwardLeaveStream)
 	h.SetStreamHandler(ClientProtocolID, n.handleClientStream)
 	return n, nil
 }
@@ -995,6 +1029,9 @@ func (n *Node) handleShmEvent(ctx context.Context, m shmevent.Msg, crc uint32, s
 	if caller.remotePeer != "" && (m.EventType == shmevent.EventGetPrivateKey || m.EventType == shmevent.EventGetPublicKey) {
 		return errorMsg(m.ID, fmt.Errorf("%s: not available to a remote caller -- bring your own key", shmevent.EventName(m.EventType)))
 	}
+	if caller.remotePeer != "" && m.EventType == shmevent.EventLeave {
+		return errorMsg(m.ID, fmt.Errorf("leave: not available to a remote caller -- only this node's own operator decides to leave"))
+	}
 	if shmevent.RequiresSignature(m.EventType) {
 		if err := shmevent.Verify(caller.verifyPub, m, crc, sig); err != nil {
 			return errorMsg(m.ID, err)
@@ -1171,6 +1208,12 @@ func (n *Node) handleShmEvent(ctx context.Context, m shmevent.Msg, crc uint32, s
 			return errorMsg(m.ID, err)
 		}
 		return shmevent.Msg{EventType: shmevent.EventLogPermitRevoke, ID: m.ID}
+
+	case shmevent.EventLeave:
+		if err := n.leaveCluster(ctx); err != nil {
+			return errorMsg(m.ID, err)
+		}
+		return shmevent.Msg{EventType: shmevent.EventLeave, ID: m.ID}
 
 	case shmevent.EventExecute:
 		if err := n.dispatchExecute(ctx, m); err != nil {
@@ -1370,14 +1413,27 @@ func (n *Node) handleAdd(ctx context.Context, leaderPeerID string) (string, erro
 		}
 	}
 
-	if err := n.join(ctx, leaderAddr); err != nil {
+	status, err := n.join(ctx, leaderAddr)
+	if err != nil {
 		return "", fmt.Errorf("join: %w", err)
 	}
-	return n.peerID, nil
+	// status is "ok" (admitted immediately, today's default behavior) or
+	// "pending" (Config.RequireConfirmForJoin is set on the target and
+	// this join is now a pending shmevent.KindClusterJoin record awaiting
+	// a confirmed voter's approval) -- appended as a space-delimited
+	// suffix since peer ids (base58, see registry.IsMultiaddr's sibling
+	// assumptions elsewhere) never contain whitespace. Bootstrap/learner
+	// join above return the bare peer id, implying "ok" for callers that
+	// don't split on a suffix at all (e.g. bootUp's existing shmclient.Add
+	// callers, which only check the error).
+	return n.peerID + " " + status, nil
 }
 
-// join asks the leader reachable at leaderAddr to add this node as a voter.
-func (n *Node) join(ctx context.Context, leaderAddr string) error {
+// join asks the leader reachable at leaderAddr to add this node as a
+// voter, and returns "ok" (admitted immediately) or "pending" (lodged as a
+// pending join request awaiting a confirmed voter's approval -- see
+// Config.RequireConfirmForJoin) on success.
+func (n *Node) join(ctx context.Context, leaderAddr string) (string, error) {
 	// If this node needs a relay reservation to be reachable at all (see
 	// Config.RelayPeer), give it a moment to complete before doing anything
 	// else: AutoRelay's reservation happens asynchronously in the background
@@ -1417,42 +1473,46 @@ func (n *Node) join(ctx context.Context, leaderAddr string) error {
 
 	maddr, err := multiaddr.NewMultiaddr(leaderAddr)
 	if err != nil {
-		return fmt.Errorf("invalid leader address %q: %w", leaderAddr, err)
+		return "", fmt.Errorf("invalid leader address %q: %w", leaderAddr, err)
 	}
 	info, err := peer.AddrInfoFromP2pAddr(maddr)
 	if err != nil {
-		return fmt.Errorf("leader address %q missing peer id: %w", leaderAddr, err)
+		return "", fmt.Errorf("leader address %q missing peer id: %w", leaderAddr, err)
 	}
 	if err := n.host.Connect(ctx, *info); err != nil {
-		return fmt.Errorf("connect to leader %s: %w", info.ID, err)
+		return "", fmt.Errorf("connect to leader %s: %w", info.ID, err)
 	}
 
 	s, err := n.host.NewStream(ctx, info.ID, JoinProtocolID)
 	if err != nil {
-		return fmt.Errorf("open join stream to leader %s: %w", info.ID, err)
+		return "", fmt.Errorf("open join stream to leader %s: %w", info.ID, err)
 	}
 	defer s.Close()
 
 	selfAddr := n.advertisedAddrs()[0]
 	if _, err := fmt.Fprintf(s, "%s %s voter\n", n.peerID, selfAddr); err != nil {
-		return fmt.Errorf("send join request: %w", err)
+		return "", fmt.Errorf("send join request: %w", err)
 	}
 	if err := s.CloseWrite(); err != nil {
-		return fmt.Errorf("close join request: %w", err)
+		return "", fmt.Errorf("close join request: %w", err)
 	}
 
 	scanner := bufio.NewScanner(s)
 	if !scanner.Scan() {
 		if err := scanner.Err(); err != nil {
-			return fmt.Errorf("read join response: %w", err)
+			return "", fmt.Errorf("read join response: %w", err)
 		}
-		return fmt.Errorf("no response from leader %s", info.ID)
+		return "", fmt.Errorf("no response from leader %s", info.ID)
 	}
 	line := scanner.Text()
-	if line == "OK" {
-		return nil
+	switch line {
+	case "OK":
+		return "ok", nil
+	case "PENDING":
+		return "pending", nil
+	default:
+		return "", fmt.Errorf("leader rejected join: %s", line)
 	}
-	return fmt.Errorf("leader rejected join: %s", line)
 }
 
 // handleJoinStream is the leader-side handler for JoinProtocolID: it parses
@@ -1472,7 +1532,7 @@ func (n *Node) handleJoinStream(s network.Stream) {
 
 	rf := n.getRaft()
 	if rf != nil && rf.State() == raft.Leader {
-		fmt.Fprintf(s, "%s\n", n.addServerLine(context.Background(), rf, joinPeerID, joinAddr, suffrage))
+		fmt.Fprintf(s, "%s\n", n.admitOrLodgeJoin(context.Background(), rf, joinPeerID, joinAddr, suffrage))
 		return
 	}
 
@@ -1518,7 +1578,7 @@ func (n *Node) handleForwardJoinStream(s network.Stream) {
 		return
 	}
 
-	fmt.Fprintf(s, "%s\n", n.addServerLine(context.Background(), rf, joinPeerID, joinAddr, suffrage))
+	fmt.Fprintf(s, "%s\n", n.admitOrLodgeJoin(context.Background(), rf, joinPeerID, joinAddr, suffrage))
 }
 
 // parseJoinRequest reads and parses the single
@@ -1555,6 +1615,41 @@ func parseJoinRequest(s network.Stream) (peerID, addr string, suffrage raft.Serv
 		return "", "", raft.Voter, fmt.Errorf("unknown suffrage %q", suffrageWord)
 	}
 	return peerID, addr, suffrage, nil
+}
+
+// admitOrLodgeJoin is handleJoinStream/handleForwardJoinStream's shared
+// decision point, called only once rf.State()==Leader is already
+// confirmed: it runs addServerLine immediately (today's behavior) unless
+// Config.RequireConfirmForJoin is set, in which case it instead lodges a
+// pending shmevent.KindClusterJoin record and replies "PENDING" -- the
+// actual raft.AddVoter/AddNonvoter only happens later, once some other
+// confirmed voter promotes that record (see applyConfirm's
+// KindClusterJoin handling).
+func (n *Node) admitOrLodgeJoin(ctx context.Context, rf *raft.Raft, joinPeerID, joinAddr string, suffrage raft.ServerSuffrage) string {
+	if !n.cfg.RequireConfirmForJoin {
+		return n.addServerLine(ctx, rf, joinPeerID, joinAddr, suffrage)
+	}
+	return n.lodgeJoinRequest(ctx, joinPeerID, joinAddr, suffrage)
+}
+
+// lodgeJoinRequest records joinPeerID's join request as a pending
+// shmevent.KindClusterJoin system record instead of admitting it
+// immediately -- see Config.RequireConfirmForJoin. It goes through
+// handleSetForward exactly like EventPermitRequest's own case in
+// handleShmEvent does (kind-agnostic replication, no special raft-
+// membership awareness needed here at all -- that only happens at
+// confirm time).
+func (n *Node) lodgeJoinRequest(ctx context.Context, joinPeerID, joinAddr string, suffrage raft.ServerSuffrage) string {
+	sf := shmevent.SuffrageVoter
+	if suffrage == raft.Nonvoter {
+		sf = shmevent.SuffrageLearner
+	}
+	key := shmevent.SystemKey(shmevent.KindClusterJoin, shmevent.StatusPending, []byte(joinPeerID))
+	metadata := shmevent.EncodeClusterJoinMetadata(joinAddr, sf)
+	if err := n.handleSetForward(ctx, key, metadata, true); err != nil {
+		return fmt.Sprintf("ERR: %v", err)
+	}
+	return "PENDING"
 }
 
 // addServerLine runs raft.AddVoter or raft.AddNonvoter (per suffrage) for
@@ -1783,7 +1878,7 @@ func (n *Node) handleConfirmForward(ctx context.Context, op kvfsm.OpType, key1, 
 		return err
 	}
 	if isLeader {
-		return n.applyConfirm(rf, op, key1, key2)
+		return n.applyConfirm(ctx, rf, op, key1, key2)
 	}
 	if !allowForward {
 		return fmt.Errorf("not leader; current leader is %s (already forwarded once)", leaderID)
@@ -1791,7 +1886,7 @@ func (n *Node) handleConfirmForward(ctx context.Context, op kvfsm.OpType, key1, 
 	return n.forwardConfirm(ctx, leaderID, op, key1, key2)
 }
 
-func (n *Node) applyConfirm(rf *raft.Raft, op kvfsm.OpType, key1, key2 []byte) error {
+func (n *Node) applyConfirm(ctx context.Context, rf *raft.Raft, op kvfsm.OpType, key1, key2 []byte) error {
 	cmd := kvfsm.EncodeCommand(op, key1, key2)
 	future := rf.Apply(cmd, 10*n.electionTimeout)
 	if err := future.Error(); err != nil {
@@ -1799,6 +1894,46 @@ func (n *Node) applyConfirm(rf *raft.Raft, op kvfsm.OpType, key1, key2 []byte) e
 	}
 	if res, ok := future.Response().(kvfsm.ApplyResult); ok && res.Err != nil {
 		return res.Err
+	}
+	if op == kvfsm.OpConfirm {
+		if err := n.admitClusterJoinIfConfirmed(ctx, rf, key2); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// admitClusterJoinIfConfirmed is applyConfirm's one special case: every
+// other kind's OpConfirm is just a replicated status flip (see
+// kvfsm.Apply's OpConfirm case), but promoting a pending
+// shmevent.KindClusterJoin record to confirmed must also actually admit
+// the joining peer into the raft configuration -- this is the only place
+// EventPermitConfirm's workflow ever triggers raft.AddVoter/AddNonvoter,
+// as opposed to handleJoinStream's immediate (Config.RequireConfirmForJoin
+// == false) path. No-op for every other kind. Called only from
+// applyConfirm, always with rf already established as this node's own
+// *leader* raft handle (guaranteed by applyConfirm's two call sites in
+// handleConfirmForward), so addServerLine can run directly here with no
+// further leader resolution or forwarding needed.
+func (n *Node) admitClusterJoinIfConfirmed(ctx context.Context, rf *raft.Raft, confirmedKey []byte) error {
+	if len(confirmedKey) < 3 || confirmedKey[0] != shmevent.SystemKeyPrefix || confirmedKey[1] != shmevent.KindClusterJoin {
+		return nil
+	}
+	peerID := string(confirmedKey[3:])
+	value, err := n.store.Get(confirmedKey)
+	if err != nil {
+		return fmt.Errorf("cluster join: read confirmed record for %s: %w", peerID, err)
+	}
+	addr, sf, err := shmevent.DecodeClusterJoinMetadata(value)
+	if err != nil {
+		return fmt.Errorf("cluster join: decode confirmed record for %s: %w", peerID, err)
+	}
+	suffrage := raft.Voter
+	if sf == shmevent.SuffrageLearner {
+		suffrage = raft.Nonvoter
+	}
+	if line := n.addServerLine(ctx, rf, peerID, addr, suffrage); strings.HasPrefix(line, "ERR:") {
+		return fmt.Errorf("cluster join: %s", strings.TrimPrefix(line, "ERR: "))
 	}
 	return nil
 }
@@ -1894,6 +2029,108 @@ func isVoter(rf *raft.Raft, id raft.ServerID) bool {
 		}
 	}
 	return false
+}
+
+// removeServerLine runs raft.RemoveServer for peerID and returns the
+// response line: "OK" or "ERR: <reason>" -- addServerLine's counterpart
+// for leaving instead of joining. Every call site already only reaches
+// this once rf.State()==Leader is confirmed. On success it also deletes
+// peerID's KindClusterMember record (reusing applyConfirm's OpDel path,
+// the same one EventPermitRevoke uses) -- membership no longer holds, so
+// the mirror shouldn't keep claiming it does. Shrinking the configuration
+// this way is graceful: the remaining voters keep operating normally,
+// exactly like hashicorp/raft already tolerates any minority of members
+// being unreachable.
+func (n *Node) removeServerLine(ctx context.Context, rf *raft.Raft, peerID string) string {
+	future := rf.RemoveServer(raft.ServerID(peerID), 0, 10*time.Second)
+	if err := future.Error(); err != nil {
+		return fmt.Sprintf("ERR: %v", err)
+	}
+	if err := n.applyConfirm(ctx, rf, kvfsm.OpDel, shmevent.ClusterMemberKey([]byte(peerID)), nil); err != nil {
+		fmt.Fprintf(os.Stderr, "daemon: remove cluster member record %s: %v\n", peerID, err)
+	}
+	return "OK"
+}
+
+// leaveCluster asks the raft cluster this node currently belongs to
+// (identified purely by this node's own live raft handle -- there's
+// nothing else to specify) to remove it via raft.RemoveServer: applies
+// directly if this node is already the leader, or forwards one hop over
+// ForwardLeaveProtocolID otherwise. Mirrors handleConfirmForward's shape
+// rather than join's public-facing JoinProtocolID dance, since a leaving
+// node -- unlike a brand new joiner -- is already a member with its own
+// live raft handle and leader-tracking; it never needs to ask an
+// arbitrary stranger node to introduce it.
+func (n *Node) leaveCluster(ctx context.Context) error {
+	rf, isLeader, leaderID, err := n.resolveWriteTarget(5 * n.electionTimeout)
+	if err != nil {
+		return err
+	}
+	if isLeader {
+		if line := n.removeServerLine(ctx, rf, n.peerID); strings.HasPrefix(line, "ERR:") {
+			return fmt.Errorf("%s", strings.TrimPrefix(line, "ERR: "))
+		}
+		return nil
+	}
+	return n.forwardLeave(ctx, leaderID)
+}
+
+// forwardLeave relays a leave request to leaderID over
+// ForwardLeaveProtocolID, mirroring forwardConfirm's wire convention
+// (empty response = success, non-empty = the leader's error message) --
+// but with no payload at all: the peer to remove is whichever identity
+// the stream itself authenticates as, established by
+// handleForwardLeaveStream reading s.Conn().RemotePeer(), not anything
+// this side writes.
+func (n *Node) forwardLeave(ctx context.Context, leaderID raft.ServerID) error {
+	pid, err := peer.Decode(string(leaderID))
+	if err != nil {
+		return fmt.Errorf("forward leave: invalid leader id %s: %w", leaderID, err)
+	}
+	s, err := n.host.NewStream(ctx, pid, ForwardLeaveProtocolID)
+	if err != nil {
+		return fmt.Errorf("forward leave to leader %s: %w", leaderID, err)
+	}
+	defer s.Close()
+
+	if err := s.CloseWrite(); err != nil {
+		return fmt.Errorf("forward leave: close write to leader %s: %w", leaderID, err)
+	}
+
+	respBuf, err := io.ReadAll(s)
+	if err != nil {
+		return fmt.Errorf("forward leave: read response from leader %s: %w", leaderID, err)
+	}
+	if len(respBuf) > 0 {
+		return fmt.Errorf("forward leave: %s", respBuf)
+	}
+	return nil
+}
+
+// handleForwardLeaveStream is the leader-side handler for
+// ForwardLeaveProtocolID: it removes whichever peer the stream's own
+// libp2p-authenticated connection identity names -- s.Conn().RemotePeer(),
+// unforgeable by anything a caller could put in a payload -- from the
+// raft configuration. There is no payload to parse at all: unlike
+// handleForwardConfirmStream (which acts on an arbitrary peerID named in
+// the forwarded command, restricted to voters only), a leave request can
+// only ever remove the requester itself.
+func (n *Node) handleForwardLeaveStream(s network.Stream) {
+	defer s.Close()
+
+	remote := s.Conn().RemotePeer()
+	rf := n.getRaft()
+	if rf == nil || rf.State() != raft.Leader {
+		var leaderID raft.ServerID
+		if rf != nil {
+			_, leaderID = rf.LeaderWithID()
+		}
+		fmt.Fprintf(s, "not leader; current leader is %s (already forwarded once)", leaderID)
+		return
+	}
+	if line := n.removeServerLine(context.Background(), rf, remote.String()); strings.HasPrefix(line, "ERR:") {
+		s.Write([]byte(strings.TrimPrefix(line, "ERR: ")))
+	}
 }
 
 // dispatchExecute implements EventExecute (see that event's doc comment

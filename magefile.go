@@ -811,6 +811,66 @@ func runAddNodeWithKey(keyFile string, peerIDs ...string) error {
 	return nil
 }
 
+// Join asks the raft cluster reachable through targetPeerID to admit the
+// current node's own identity (see `mage use`), switching it onto a
+// composite data dir dedicated to that cluster. If the target requires
+// confirmation (-require-confirm-for-join), this only lodges a pending
+// request -- ask a current raft voter on that cluster to run
+// `mage confirmpermit cluster-join <peerID>` to actually admit it.
+//
+// Usage: mage join <targetPeerID>
+func Join(targetPeerID string) error {
+	root, err := repoRoot()
+	if err != nil {
+		return err
+	}
+	peerID, err := kvctl.Join(root, targetPeerID)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("✅ node %s is up and selected as current\n", peerID)
+	return nil
+}
+
+// Leave asks the raft cluster the current node is joined to (see `mage
+// use`) to remove it (raft.RemoveServer -- a graceful shrink, the
+// remaining voters keep operating normally), then switches the node back
+// onto its own default solo single-node cluster. The composite cluster
+// data dir is left on disk untouched, so a later `mage join`/
+// `mage rejoinnode` back to the same cluster can pick its local state
+// back up -- see Rm for the variant that wipes it instead.
+//
+// Usage: mage leave <peerID>
+func Leave(peerID string) error {
+	root, err := repoRoot()
+	if err != nil {
+		return err
+	}
+	if err := kvctl.Leave(root, peerID); err != nil {
+		return err
+	}
+	fmt.Printf("✅ node %s left its cluster and resumed its solo db\n", peerID)
+	return nil
+}
+
+// Rm does everything Leave does, plus revokes peerID's standing with the
+// cluster it's leaving (so a later `mage join` attempt against the same
+// cluster starts genuinely pending again, not auto-approved by a stale
+// confirmed record) and deletes the composite cluster data dir outright.
+//
+// Usage: mage rm <peerID>
+func Rm(peerID string) error {
+	root, err := repoRoot()
+	if err != nil {
+		return err
+	}
+	if err := kvctl.Rm(root, peerID); err != nil {
+		return err
+	}
+	fmt.Printf("🗑️  node %s removed from its cluster and resumed its solo db\n", peerID)
+	return nil
+}
+
 // Use selects which node Set/Get target, by peer id.
 // Usage: mage use <peerID>
 func Use(peerID string) error {

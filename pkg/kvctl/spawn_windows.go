@@ -22,3 +22,17 @@ func isAlive(pid int) bool {
 	_, err := os.FindProcess(pid)
 	return err == nil
 }
+
+// terminate asks pid to shut down -- a hard kill on Windows (see
+// isAlive's doc comment: os.Process.Signal only supports os.Kill here, no
+// graceful-shutdown signal equivalent to Unix's SIGTERM is available
+// through this API) -- used by Leave/Rm to restart a node against a
+// different data dir without requiring the operator to stop it manually
+// first, unlike every other kvctl operation.
+func terminate(pid int) error {
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		return err
+	}
+	return proc.Kill()
+}

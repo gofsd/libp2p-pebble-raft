@@ -25,3 +25,16 @@ func isAlive(pid int) bool {
 	}
 	return proc.Signal(syscall.Signal(0)) == nil
 }
+
+// terminate asks pid to shut down gracefully (SIGTERM, caught by the
+// daemon's normal ctx-cancellation shutdown path -- see pkg/daemon.Run) --
+// used by Leave/Rm to restart a node against a different data dir without
+// requiring the operator to stop it manually first, unlike every other
+// kvctl operation.
+func terminate(pid int) error {
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		return err
+	}
+	return proc.Signal(syscall.SIGTERM)
+}

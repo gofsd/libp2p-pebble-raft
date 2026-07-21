@@ -109,6 +109,32 @@ kvctl.ResumeNode(repoRoot, ownPeerID)
 kvctl.AddNode(repoRoot, leaderPeerID, ownPeerID) // 2-arg rejoin form
 ```
 
+Moving an *existing* node between clusters, rather than spawning a new one — `Join` reuses
+`AddNode`'s own join wire protocol under the current identity (`registry.Registry.Current`),
+stopping/restarting its process as needed:
+
+```go
+// Ask targetPeerID's cluster to admit the current node. Immediate, or
+// pending-until-confirmed, depending on targetPeerID's own daemon's
+// Config.RequireConfirmForJoin -- see README.md's "Changing which cluster
+// a node belongs to" section.
+peerID, err := kvctl.Join(repoRoot, targetPeerID)
+
+// If a confirmation is required, run this against any current raft voter
+// of targetPeerID's cluster (thin wrapper over ConfirmPermit(KindClusterJoin, ...)):
+kvctl.ConfirmPermit(shmevent.KindClusterJoin, []byte(peerID))
+
+// Gracefully leave: raft.RemoveServer (the remaining voters keep operating
+// normally), then resume ownPeerID's own solo db. The composite cluster
+// dir is left on disk, so a later Join/AddNode-rejoin picks it back up.
+err = kvctl.Leave(repoRoot, ownPeerID)
+
+// Leave, plus revoke this identity's cluster-join standing (so a later
+// Join needs a fresh confirmation, not a stale one) and delete the
+// composite cluster dir outright.
+err = kvctl.Rm(repoRoot, ownPeerID)
+```
+
 Other `pkg/kvctl` functions worth knowing (all operate on the registry's
 "current" node unless noted):
 
@@ -120,8 +146,11 @@ Other `pkg/kvctl` functions worth knowing (all operate on the registry's
 | `LogQuery(kind, unitID string, start, end time.Time, limit int) ([]logrecord.Record, error)` | Scan records in a time window, oldest first. |
 | `Execute(destPeerID, value string) error` | Send a raw peer-to-peer notification, bypassing raft entirely. |
 | `PollExecute() (senderPeerID, value string, ok bool, err error)` | Drain one queued `Execute` notification. |
-| `RequestPermit`/`ConfirmPermit`/`RevokePermit(kind byte, targetPeerID, metadata []byte)` | Manage relay/remote-access permits — see `README.md`'s permit sections for when these are needed. |
+| `RequestPermit`/`ConfirmPermit`/`RevokePermit(kind byte, targetPeerID, metadata []byte)` | Manage relay/remote-access/cluster-join permits — see `README.md`'s permit sections for when these are needed. `kind` is `shmevent.KindPermitPeer`/`KindBootstrapNode`/`KindClusterJoin`. |
 | `RequestLogPermit`/`ConfirmLogPermit`/`RevokeLogPermit(logKind string, targetPeerID, metadata []byte)` | Same, scoped per `pkg/logrecord` kind. |
+| `Join(repoRoot, targetPeerID string) (string, error)` | Switch the current identity onto targetPeerID's cluster (see above). |
+| `Leave(repoRoot, ownPeerID string) error` | Gracefully leave ownPeerID's current cluster; resumes its solo db. |
+| `Rm(repoRoot, ownPeerID string) error` | `Leave` plus revoke standing and delete the composite cluster dir. |
 
 All of `kvctl`'s registry-backed functions (`Set`, `Get`, `Use`, the permit
 helpers, `LogAppend`/`LogQuery`) read `registry.Open()`'s on-disk state —
@@ -167,6 +196,7 @@ for exact semantics of each:
 - `Set(ctx, key, value string) error`
 - `Get(ctx, key string) (string, error)`
 - `Add(ctx, leaderPeerID string) (string, error)` — bootstrap/join
+- `Leave(ctx) error` — ask the current cluster to `raft.RemoveServer` this node (see `README.md`'s `join`/`leave`/`rm` section); local-only, no remote caller may issue it
 - `LogAppend(ctx, key, value []byte) error` — raw `pkg/logrecord` write; prefer `pkg/logrecord.BuildKey`+`Record.Encode` to build `key`/`value`, or use `kvctl.LogAppend` for the friendly form
 - `ListRange(ctx, start, end []byte) (key, value []byte, ok bool, err error)` — one match at a time; loop, narrowing `start` past the last returned key, for a full range scan
 - `RequestPermit`/`ConfirmPermit`/`RevokePermit(ctx, kind byte, peerID, metadata []byte) error`
