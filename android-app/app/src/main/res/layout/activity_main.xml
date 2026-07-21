@@ -3,7 +3,7 @@
     android:orientation="vertical"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    android:padding="24dp">
+    android:padding="16dp">
 
     <TextView
         android:id="@+id/statusText"
@@ -11,53 +11,41 @@
         android:layout_height="wrap_content"
         android:text="Connecting to cluster..."
         android:textSize="14sp"
-        android:paddingBottom="24dp" />
+        android:paddingBottom="12dp" />
 
-    <EditText
-        android:id="@+id/keyInput"
+    <Spinner
+        android:id="@+id/commandSpinner"
         android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:hint="key" />
-
-    <EditText
-        android:id="@+id/valueInput"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:hint="value" />
+        android:layout_height="wrap_content" />
 
     <LinearLayout
-        android:orientation="horizontal"
+        android:id="@+id/paramsContainer"
+        android:orientation="vertical"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:paddingTop="16dp">
+        android:paddingTop="8dp" />
 
-        <Button
-            android:id="@+id/submitButton"
-            android:layout_width="0dp"
-            android:layout_height="wrap_content"
-            android:layout_weight="1"
-            android:text="Submit" />
-
-        <Button
-            android:id="@+id/getButton"
-            android:layout_width="0dp"
-            android:layout_height="wrap_content"
-            android:layout_weight="1"
-            android:text="Get" />
-
-        <Button
-            android:id="@+id/clusterButton"
-            android:layout_width="0dp"
-            android:layout_height="wrap_content"
-            android:layout_weight="1"
-            android:text="Cluster" />
-    </LinearLayout>
-
-    <TextView
-        android:id="@+id/resultText"
+    <Button
+        android:id="@+id/runButton"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:paddingTop="24dp"
-        android:textSize="14sp" />
+        android:layout_marginTop="8dp"
+        android:text="Run" />
+
+    <ScrollView
+        android:id="@+id/outputScroll"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1"
+        android:layout_marginTop="12dp">
+
+        <TextView
+            android:id="@+id/outputText"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:fontFamily="monospace"
+            android:textIsSelectable="true"
+            android:textSize="12sp" />
+    </ScrollView>
 
 </LinearLayout>
