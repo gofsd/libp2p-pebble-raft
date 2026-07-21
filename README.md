@@ -283,7 +283,10 @@ own `LogAppend` calls, watched for and re-fetched via `LogQuery` on each poke).
 "update" is a fresh revision under the same ID, "delete" a tombstone revision, readers always fold
 down to the latest. A `Command` names a `TargetPeerID` (who executes it) and a `FormSchema` (JSON
 `[]FormField`) describing the inputs its submission form should collect — `kvmobile` only stores
-and discovers a `Command`'s definition, it doesn't interpret or run one.
+and discovers a `Command`'s definition, it doesn't interpret or run one. **This is a separate,
+older model from desktop's own `mage`/`pkg/kvctl` Group/Command catalog** (see "Group/command ACL"
+below), which was rewritten onto real daemon-enforced ACL records; `mobile/kvmobile/catalog.go` has
+not been rewired onto that newer model and still works exactly as described in this section.
 
 "Participant of group G" is `IsGroupParticipant(G)`: a confirmed `KindLogPermit` record for
 `logKind = "command:"+G`, the *same* string `G`'s commands are stored under (see `commandLogKind`)
@@ -456,6 +459,40 @@ with `logrecord.LogKeyPrefix`), not only whether `start` itself happens to land 
 so a `start` chosen from entirely outside the namespace (even the empty string) paired
 with an `end` reaching past it would otherwise still return real logrecord data — bypassing
 the per-kind permit check completely rather than just returning nothing.
+
+## Group/command ACL
+
+Desktop's `mage`/`pkg/kvctl` has its own group-based command ACL, separate from (and, unlike, see
+above) `mobile/kvmobile`'s older client-side-only catalog: `Group` (`id`, `name`) and `Command`
+(`id`, `name`, `peer_id` — the command's `TargetPeerID`) are direct records, and `GroupCommand`/
+`PeerGroup` are many-to-many relations linking commands to groups and peers to groups
+respectively. All four are real `shmevent.SystemKeyPrefix` records (`KindGroup`/`KindCommand`/
+`KindGroupCommand`/`KindPeerGroup`), daemon-enforced rather than a client-side convention:
+
+```bash
+mage creategroup g1 infantry            # or 'updategroup g1 <newname>' -- same call, Put semantics
+mage createcommand c1 resupply <peerID> # Command's peer_id is who may execute it
+mage addcommandtogroup c1 g1            # link: c1 is now reachable through group g1
+mage addpeertogroup <peerID> g1         # membership: peerID may now submit/execute c1
+mage submitcommand c1 '{"qty":"20"}'    # dispatches c1, gated by GroupCommand+PeerGroup below
+```
+
+CRUD (`creategroup`/`updategroup`/`deletegroup`, `createcommand`/`updatecommand`/`deletecommand`,
+`addcommandtogroup`/`removecommandfromgroup`, `addpeertogroup`/`removepeerfromgroup`) is
+single-step and voter-gated — any one current raft voter may write any of these four kinds
+unilaterally, no second-voter confirmation, reusing the same voter-gated forwarding path
+`confirmpermit`/`confirmlogpermit` use (`handleForwardConfirmStream`, widened to also accept a
+plain `kvfsm.OpSet`) rather than a separate pending→confirmed dance. `submitcommand`'s
+authorization check (`isPermittedForCommand`) is a real join over the two relation kinds: it walks
+the command's linked groups (`GroupCommand`, capped small — see below) and point-checks the
+submitting peer's membership (`PeerGroup`) in each, refusing if the command isn't linked to any
+group the caller belongs to.
+
+Deleting a `Group` or `Command` cascades in the same raft `Apply` (`pkg/kvfsm.OpCascadeDelete`): every
+`GroupCommand`/`PeerGroup` record referencing the deleted id is removed alongside it, so a delete
+never leaves a dangling relation behind. `Group` and `Command` records each have their own list cap
+— 200 groups, 2000 commands (`pkg/kvfsm`'s `systemListLimits`) — tighter than the 65000-entry
+default every other `SystemKeyPrefix` kind (including `GroupCommand`/`PeerGroup` themselves) gets.
 
 ## Vendored dependency patch
 

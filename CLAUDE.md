@@ -84,15 +84,23 @@ cluster picks its local state back up); `rm` deletes it and also revokes standin
 `cluster-join` permit kind, so a later `join` attempt starts genuinely pending again rather than
 being silently re-admitted.
 
-Catalog/dispatch targets (wrap `pkg/kvctl/catalog.go`+`dispatch.go`, the `mage`-side mirror of
-`mobile/kvmobile`'s Group/Command/execution layer — see README's `kvmobile` section for the
-concepts, since the two are otherwise identical):
+Catalog/dispatch targets (wrap `pkg/kvctl/catalog.go`+`dispatch.go`). The Group/Command catalog
+itself (`creategroup`/`createcommand`/etc.) is **daemon-enforced ACL state** — real
+`shmevent.SystemKeyPrefix` records (`KindGroup`/`KindCommand`/`KindGroupCommand`/`KindPeerGroup`),
+voter-gated CRUD, same as permits — see README's "Group/command ACL" section for the model.
+`SubmitCommand`/dispatch itself is still `pkg/logrecord`-based, same as before. **This is not the
+same model `mobile/kvmobile`'s own Group/Command catalog uses** — `mobile/kvmobile/catalog.go`
+still has its own, older, client-side-only participation model (`pkg/logrecord` chains + a
+`KindLogPermit` grant, enforced only inside `kvmobile` itself) and has not been rewired onto the
+daemon-enforced kinds; see README's `kvmobile` section for that one specifically:
 
 ```bash
-mage creategroup/updategroup/deletegroup/getgroup/listgroups <args>
-mage requestgroupparticipation/confirmgroupparticipation/revokegroupparticipation <groupID> <peerID> ...
-mage isgroupparticipant <groupID>
-mage createcommand/updatecommand/deletecommand/getcommand/listcommands <args>
+mage creategroup/updategroup/deletegroup/getgroup/listgroups <id> [name]
+mage addpeertogroup/removepeerfromgroup <peerID> <groupID>
+mage listgroupsforpeer <peerID>
+mage createcommand/updatecommand/deletecommand/getcommand/listcommands <id> [name peerID]
+mage addcommandtogroup/removecommandfromgroup <commandID> <groupID>
+mage listgroupsforcommand <commandID>
 mage submitcommand/getcommandrequest/listcommandrequests <args>
 mage listexecutions <peerID>
 mage appendcommandlog/querycommandlog/latestcommandlog <args>
