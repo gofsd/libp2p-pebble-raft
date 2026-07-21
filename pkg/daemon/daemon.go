@@ -12,6 +12,7 @@ package daemon
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/hex"
 	"encoding/json"
@@ -1025,6 +1026,34 @@ func (a relayACL) AllowConnect(src peer.ID, _ multiaddr.Multiaddr, _ peer.ID) bo
 // record for the caller's own authenticated peer id. EventLogAppend and
 // EventListRange are separately, additionally gated per log kind by
 // Config.RequirePermitForLog -- see those cases below.
+
+// logNamespaceLo and logNamespaceHi bound the half-open interval [lo, hi)
+// containing exactly every possible key that begins with
+// logrecord.LogKeyPrefix, regardless of what follows it or how long it
+// is: any such key compares >= []byte{LogKeyPrefix} and <
+// []byte{LogKeyPrefix+1} under bytes.Compare (a shared first byte makes
+// length/suffix irrelevant to that particular comparison), and no key
+// that doesn't start with LogKeyPrefix can fall in that interval either
+// way -- see overlapsLogNamespace.
+var (
+	logNamespaceLo = []byte{logrecord.LogKeyPrefix}
+	logNamespaceHi = []byte{logrecord.LogKeyPrefix + 1}
+)
+
+// overlapsLogNamespace reports whether the inclusive byte range [start,
+// end] could return any pkg/logrecord-prefixed key, for
+// EventListRange's Config.RequirePermitForLog gate -- not just whether
+// start itself happens to begin there. pkg/store.Store.ScanRange has no
+// concept of namespaces: a caller could pick a start from outside the
+// logrecord namespace entirely (the empty string, or a key under
+// shmevent.SystemKeyPrefix) paired with an end chosen past it, and still
+// have logrecord data caught inside that wider range -- a check that only
+// inspected start[0] would never trigger for that case, even though the
+// scan itself would still return the data.
+func overlapsLogNamespace(start, end []byte) bool {
+	return bytes.Compare(start, logNamespaceHi) < 0 && bytes.Compare(end, logNamespaceLo) >= 0
+}
+
 func (n *Node) handleShmEvent(ctx context.Context, m shmevent.Msg, crc uint32, sig []byte, caller callerIdentity) shmevent.Msg {
 	if caller.remotePeer != "" && (m.EventType == shmevent.EventGetPrivateKey || m.EventType == shmevent.EventGetPublicKey) {
 		return errorMsg(m.ID, fmt.Errorf("%s: not available to a remote caller -- bring your own key", shmevent.EventName(m.EventType)))
@@ -1252,17 +1281,23 @@ func (n *Node) handleShmEvent(ctx context.Context, m shmevent.Msg, crc uint32, s
 		if err != nil {
 			return errorMsg(m.ID, err)
 		}
-		// Config.RequirePermitForLog only applies to a range that's
-		// actually claiming to be inside pkg/logrecord's namespace --
+		// Config.RequirePermitForLog only applies to a range that could
+		// actually return something inside pkg/logrecord's namespace --
 		// anything else (ordinary data, shmevent.SystemKeyPrefix data)
 		// falls through unchanged, governed only by the generic
-		// RequirePermitForRemote gate above, same as today. Both start
-		// and end must parse to the same kind: ScanRange is a raw byte
-		// range with no logical confinement, so checking only start would
-		// let a permitted start smuggle in an end that overruns into an
-		// unpermitted kind's range.
+		// RequirePermitForRemote gate above, same as today. This checks
+		// for any overlap with that namespace (see overlapsLogNamespace),
+		// not just whether start itself begins there: pkg/store.ScanRange
+		// is a raw byte range with no concept of namespaces, so a start
+		// chosen from outside the namespace (even the empty string) paired
+		// with an end chosen past it would still return logrecord data --
+		// checking only start[0] would let that through ungated. Both
+		// start and end must parse to the same kind once the gate is
+		// triggered: checking only start would let a permitted start
+		// smuggle in an end that overruns into an unpermitted kind's
+		// range.
 		if caller.remotePeer != "" && n.cfg.RequirePermitForLog &&
-			len(start) > 0 && start[0] == logrecord.LogKeyPrefix {
+			overlapsLogNamespace(start, end) {
 			kindStart, _, _, errStart := logrecord.ParseKey(start)
 			kindEnd, _, _, errEnd := logrecord.ParseKey(end)
 			if errStart != nil || errEnd != nil || kindStart != kindEnd {

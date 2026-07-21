@@ -181,6 +181,66 @@ func TestLogPermitKindIsolation(t *testing.T) {
 	}
 }
 
+// TestRequirePermitForLogGateCoversRangeOutsideNamespace proves the
+// RequirePermitForLog gate on EventListRange can't be evaded by choosing
+// a start that doesn't literally begin with logrecord.LogKeyPrefix: a
+// range scan whose start comes from entirely outside the logrecord
+// namespace (here, the empty string) but whose end reaches into it must
+// still be rejected for an unpermitted remote caller, exactly like a
+// query that starts squarely inside the namespace already is (see
+// TestRequirePermitForLogGateRejectsUnpermitted) -- pkg/store.ScanRange
+// has no concept of namespaces, so without overlapsLogNamespace's check
+// such a query would otherwise return logrecord data the caller was
+// never granted.
+func TestRequirePermitForLogGateCoversRangeOutsideNamespace(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	leader := startTestLeader(t, ctx, Config{RequirePermitForLog: true})
+	remote, remotePriv, leaderPeerID := newTestRemoteHost(t, ctx, leader)
+
+	// Plant a real record under a kind the remote caller has no grant for
+	// at all, appended locally -- RequirePermitForLog never gates a local
+	// caller (see TestRequirePermitForLogLocalCallerNeverGated), so this
+	// is just test setup, not itself part of what's being proven.
+	base := time.Date(2026, 7, 19, 0, 0, 0, 0, time.UTC)
+	rnd, err := logrecord.NewRand()
+	if err != nil {
+		t.Fatalf("NewRand: %v", err)
+	}
+	key, err := logrecord.BuildKey("secret", "1BCT", base, rnd)
+	if err != nil {
+		t.Fatalf("BuildKey: %v", err)
+	}
+	rec := logrecord.Record{Kind: "secret", UnitID: "1BCT", Timestamp: base, Narrative: "classified"}
+	value, err := rec.Encode()
+	if err != nil {
+		t.Fatalf("Record.Encode: %v", err)
+	}
+	payload, err := shmevent.EncodeSetPayload(key, value)
+	if err != nil {
+		t.Fatalf("EncodeSetPayload: %v", err)
+	}
+	appendResp := callLocal(t, ctx, leader, shmevent.Msg{EventType: shmevent.EventLogAppend, Value: payload, ID: 1}, leader.ed25519Priv)
+	if appendResp.EventType == shmevent.EventError {
+		t.Fatalf("local plant append rejected: %s", appendResp.Value)
+	}
+
+	// A query starting well before the logrecord namespace (the empty
+	// string, the smallest possible key) with an end reaching just past
+	// the namespace's own end must still be rejected, even though
+	// start[0] doesn't equal logrecord.LogKeyPrefix -- the exact shape the
+	// old start[0]-only check let through unchecked.
+	resp := remoteQuery(t, ctx, remote, remotePriv, leaderPeerID, []byte{}, []byte{logrecord.LogKeyPrefix + 1})
+	if resp.EventType != shmevent.EventError {
+		t.Fatalf("list_range with start outside the logrecord namespace but end reaching into it unexpectedly succeeded: %+v", resp)
+	}
+	if !strings.Contains(string(resp.Value), "must be scoped") {
+		t.Fatalf("rejection = %q, want it to mention the single-kind scope requirement", resp.Value)
+	}
+}
+
 // TestLogPermitConfirmRevokeVoterOnly mirrors
 // TestPermitRequestConfirmWorkflow/TestPermitRevokeWorkflow's real
 // leader/voter/learner topology (permit_test.go), substituting
