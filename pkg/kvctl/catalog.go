@@ -2,7 +2,6 @@ package kvctl
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"time"
 
@@ -12,48 +11,35 @@ import (
 	"github.com/gofsd/libp2p-kv-raft/pkg/shmevent"
 )
 
-// This file is the desktop counterpart of mobile/kvmobile/catalog.go: a
-// caller-defined catalog of "groups" (named containers, publicly
-// listable) and "commands" (actionable operations scoped to a group,
-// each naming a TargetPeerID that executes it and a FormSchema
-// describing the inputs its submission form should collect), giving
-// `mage` parity with the Android bindings for this layer. The logic is
-// intentionally a close port, not a shared import, of kvmobile's copy --
-// see openCurrentSession's doc comment for why -- but it returns native
-// Go values (Group/Command/[]FormField) rather than kvmobile's JSON
-// strings, matching this package's own existing convention (e.g.
-// LogQuery returns []logrecord.Record, not a JSON string) since kvctl is
-// consumed by Go callers (magefile.go, tests), not gomobile bindings
-// that need string-only I/O.
+// This file implements the group-based ACL catalog: Group (id, name),
+// Command (id, name, peer_id -- where it may be executed), GroupCommand
+// (a many-to-many command<->group link, replacing an earlier one-group-
+// per-command field), and PeerGroup (a peer's group membership,
+// replacing an earlier confirmed-permit-under-a-synthetic-kind
+// convention) -- all daemon-enforced shmevent.SystemKeyPrefix records
+// (see shmevent.KindGroup's doc comment in pkg/shmevent/system.go), not
+// the pkg/logrecord convention this file used before. Any single current
+// raft voter may create/update/delete any of these four kinds directly
+// (no second-voter confirmation, see shmevent.EventGroupPut's doc
+// comment) -- and pkg/daemon itself enforces that, unlike the old scheme,
+// which nothing outside these bindings independently checked.
 //
-// Both Group and Command are stored as pkg/logrecord.Record chains --
-// append-only, with "update" meaning a fresh record under the same ID
-// and "delete" meaning a tombstone record (Fields["deleted"] == "true");
-// readers always fold a unitID's full revision history down to its
-// latest entry (see scanRevisions). This reuses pkg/logrecord's own
-// replication/durability and needs no new capnp wire schema -- every
-// operation here is a plain EventLogAppend/EventListRange call, exactly
-// like LogAppend/LogQuery.
-//
-// "Participant of group G" is a confirmed pkg/shmevent KindLogPermit
-// record for logKind commandLogKind(G) -- see IsGroupParticipant.
-// Deliberately the *same* string Commands are stored under, so
-// participation and command-namespace access are one fact rather than
-// two that could drift apart. Enforced client-side only, in kvctl
-// itself: nothing in pkg/daemon independently blocks a local caller from
-// reading or writing its own already-replicated store, so this check is
-// only as strong as every caller actually going through these bindings
-// rather than around them -- the same caveat kvmobile's copy documents.
+// dispatch.go's SubmitCommand/CommandRequest/CommandLog machinery is
+// unaffected by this file: it's a separate, still pkg/logrecord-based
+// mechanism (a durable request+response conversation, not ACL
+// configuration) that now keys off commandID alone instead of groupID,
+// and gates on isPermittedForCommand (this file) instead of group
+// participation.
 
 // openCurrentSession opens a pkg/shmclient.Session for the registry's
 // current node, alongside its own peer id (needed as AuthorPeerID for
-// every write below) -- the registry.Open+reg.Current()+shmclient.Open
-// sequence every other kvctl function already repeats per call, factored
-// out here because catalog.go/dispatch.go's functions call it many times
-// each. A *shmclient.Session has no Close/teardown to worry about (see
-// its own doc comment) -- it's just a signing key holder for per-call
-// shmring round trips, safe to open fresh on every call the way kvctl's
-// existing functions already do.
+// dispatch.go's logrecord writes) -- the registry.Open+reg.Current()+
+// shmclient.Open sequence every other kvctl function already repeats per
+// call, factored out here because catalog.go/dispatch.go's functions call
+// it many times each. A *shmclient.Session has no Close/teardown to worry
+// about (see its own doc comment) -- it's just a signing key holder for
+// per-call shmring round trips, safe to open fresh on every call the way
+// kvctl's existing functions already do.
 func openCurrentSession(ctx context.Context) (sess *shmclient.Session, selfPeerID string, err error) {
 	reg, err := registry.Open()
 	if err != nil {
@@ -70,27 +56,11 @@ func openCurrentSession(ctx context.Context) (sess *shmclient.Session, selfPeerI
 	return sess, peerID, nil
 }
 
-// logGroupKind is the fixed pkg/logrecord Kind every Group definition is
-// stored under. Unlike Command, Group listing/reading has no
-// participation gate (see CreateGroup's doc comment: it's a public
-// catalog), so it doesn't need a per-group Kind the way commandLogKind
-// does.
-const logGroupKind = "group"
-
-// commandLogKind returns the pkg/logrecord Kind every Command belonging
-// to groupID is stored under, *and* the RequestLogPermit/
-// ConfirmLogPermit/RevokeLogPermit logKind that gates participation in
-// that same group -- see this file's doc comment for why those are
-// deliberately the same string.
-func commandLogKind(groupID string) string {
-	return "command:" + groupID
-}
-
-// maxCatalogIDLen bounds Group/Command IDs, enforced by
-// validateCatalogID -- kindPrefixBounds's fixed-width upper bound is
-// built from this same constant, so it's provably wide enough to cover
-// every possible key under a kind regardless of which unitIDs actually
-// exist.
+// maxCatalogIDLen bounds Group/Command ids (validateCatalogID) and every
+// pkg/logrecord unitID dispatch.go's still-logrecord-based mechanism
+// writes -- kindPrefixBounds's fixed-width upper bound is built from this
+// same constant, so it's provably wide enough to cover every possible key
+// under a kind regardless of which unitIDs actually exist.
 const maxCatalogIDLen = 256
 
 func validateCatalogID(id string) error {
@@ -103,68 +73,12 @@ func validateCatalogID(id string) error {
 	return nil
 }
 
-// IsGroupParticipant implements `mage isgroupparticipant <groupID>`:
-// reports whether the current node's own peer id currently holds a
-// confirmed permit for groupID (see commandLogKind) -- "is a participant
-// of group G". Every Command CRUD/list/get binding below requires this
-// before proceeding; Group create/read/list do not (a public catalog) --
-// only UpdateGroup/DeleteGroup do.
-func IsGroupParticipant(groupID string) (bool, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), ipcTimeout)
-	defer cancel()
-	sess, selfPeerID, err := openCurrentSession(ctx)
-	if err != nil {
-		return false, err
-	}
-
-	key, err := shmevent.LogPermitKey(shmevent.StatusConfirmed, commandLogKind(groupID), []byte(selfPeerID))
-	if err != nil {
-		return false, fmt.Errorf("kvctl: is group participant: %w", err)
-	}
-	if _, err := sess.Get(ctx, string(key)); err != nil {
-		return false, nil
-	}
-	return true, nil
-}
-
-// RequestGroupParticipation implements `mage requestgroupparticipation
-// <groupID> <peerID> <metadata>`: lodges a pending request for
-// targetPeerID to participate in groupID -- a thin, group-scoped wrapper
-// over RequestLogPermit(commandLogKind(groupID), ...) so callers don't
-// need to know that naming convention themselves.
-func RequestGroupParticipation(groupID, targetPeerID, metadata string) error {
-	return RequestLogPermit(commandLogKind(groupID), []byte(targetPeerID), []byte(metadata))
-}
-
-// ConfirmGroupParticipation implements `mage confirmgroupparticipation
-// <groupID> <peerID>`: promotes a pending participation request for
-// targetPeerID in groupID to confirmed. Only takes effect if the current
-// node is itself a raft voter (see ConfirmLogPermit's doc comment).
-func ConfirmGroupParticipation(groupID, targetPeerID string) error {
-	return ConfirmLogPermit(commandLogKind(groupID), []byte(targetPeerID))
-}
-
-// RevokeGroupParticipation implements `mage revokegroupparticipation
-// <groupID> <peerID>`: deletes a confirmed participation record for
-// targetPeerID in groupID outright.
-func RevokeGroupParticipation(groupID, targetPeerID string) error {
-	return RevokeLogPermit(commandLogKind(groupID), []byte(targetPeerID))
-}
-
-func requireGroupParticipant(groupID string) error {
-	ok, err := IsGroupParticipant(groupID)
-	if err != nil {
-		return err
-	}
-	if !ok {
-		return fmt.Errorf("kvctl: not a participant of group %s", groupID)
-	}
-	return nil
-}
-
 // revisionHistory is scanRevisions' result: a unitID's latest revision,
 // plus who/when first created it (kept separately since "latest"
-// overwrites Timestamp/AuthorPeerID on every update).
+// overwrites Timestamp/AuthorPeerID on every update). Used by
+// dispatch.go's still-logrecord-based CommandRequest/CommandLog
+// machinery -- Group/Command themselves no longer use it (see this file's
+// doc comment).
 type revisionHistory struct {
 	latest    logrecord.Record
 	createdAt time.Time
@@ -173,8 +87,7 @@ type revisionHistory struct {
 }
 
 // scanRevisions folds every logrecord.Record for (kind, unitID) down to
-// its latest revision -- Group/Command's "current state" under the
-// append-only/latest-wins scheme this file's doc comment describes.
+// its latest revision.
 func scanRevisions(ctx context.Context, sess *shmclient.Session, kind, unitID string) (revisionHistory, error) {
 	lo, hi := logrecord.ScanBounds(kind, unitID, time.Unix(0, 0), time.Now())
 	var h revisionHistory
@@ -203,9 +116,7 @@ func scanRevisions(ctx context.Context, sess *shmclient.Session, kind, unitID st
 // kindPrefixBounds returns the [lo, hi] key range covering every record
 // of the given kind, across every unitID and timestamp -- the shared
 // bound construction behind listUnitIDs and ListExecutionsByPeer's
-// per-kind prefix scans. hi is sized from maxCatalogIDLen so it's
-// provably wide enough to cover any unitID this package itself ever
-// writes under kind, regardless of which ones actually exist.
+// per-kind prefix scans.
 func kindPrefixBounds(kind string) (lo, hi []byte) {
 	prefix := logrecord.KindPrefix(kind)
 	lo = prefix
@@ -247,8 +158,8 @@ func listUnitIDs(ctx context.Context, sess *shmclient.Session, kind string) ([]s
 }
 
 // appendRecord builds and appends one logrecord.Record, attributed to
-// authorPeerID -- the shared tail end every Group/Command/dispatch write
-// in this package reduces to.
+// authorPeerID -- the shared tail end every dispatch.go write in this
+// package reduces to.
 func appendRecord(ctx context.Context, sess *shmclient.Session, kind, unitID, authorPeerID string, fields map[string]string, narrative string) error {
 	rnd, err := logrecord.NewRand()
 	if err != nil {
@@ -277,85 +188,57 @@ func appendRecord(ctx context.Context, sess *shmclient.Session, kind, unitID, au
 	return nil
 }
 
-// Group is a caller-defined command group: a named, publicly listable
-// container for a set of Commands. Participation (see
-// IsGroupParticipant) gates Command access within it, not the Group
-// definition itself.
+// Group is a named container Commands can be linked to via
+// CreateGroupCommand -- peers become permitted to submit/execute a
+// command by being added to a group linked to it (AddPeerToGroup).
 type Group struct {
-	ID          string    `json:"id"`
-	Name        string    `json:"name"`
-	Description string    `json:"description"`
-	CreatedBy   string    `json:"created_by"`
-	CreatedAt   time.Time `json:"created_at"`
-	UpdatedAt   time.Time `json:"updated_at"`
+	ID   string `json:"id"`
+	Name string `json:"name"`
 }
 
-func recordToGroup(h revisionHistory) Group {
-	return Group{
-		ID:          h.latest.UnitID,
-		Name:        h.latest.Fields["name"],
-		Description: h.latest.Narrative,
-		CreatedBy:   h.createdBy,
-		CreatedAt:   h.createdAt,
-		UpdatedAt:   h.latest.Timestamp,
-	}
-}
+// systemKeyIDOffset is how many leading bytes of a shmevent.SystemKey
+// (kind + status placeholder) precede the trailing ID field on a
+// GroupKey/CommandKey/ClusterMemberKey -- mirrors ListClusterMembers'
+// own key[3:] slicing in cluster_list.go.
+const systemKeyIDOffset = 3
 
-// CreateGroup implements `mage creategroup <id> <name> <description>`:
-// defines a new command group under id (or appends a fresh revision over
-// an existing/deleted one -- see UpdateGroup, the same operation under a
-// different name). Unlike UpdateGroup/DeleteGroup, this has no
-// participation requirement: Groups are a public catalog, so any cluster
-// member may propose one.
-func CreateGroup(id, name, description string) error {
-	return putGroup(id, name, description, false, false)
-}
-
-// UpdateGroup implements `mage updategroup <id> <name> <description>`:
-// appends a new revision for id's name/description. Requires the caller
-// to already be a participant of id, unlike CreateGroup.
-func UpdateGroup(id, name, description string) error {
-	return putGroup(id, name, description, false, true)
-}
-
-// DeleteGroup implements `mage deletegroup <id>`: appends a tombstone
-// revision for id -- GetGroup/ListGroups exclude it afterward. Existing
-// Command records under it aren't themselves deleted, just unreachable
-// through the catalog. Requires the caller to already be a participant
-// of id.
-func DeleteGroup(id string) error {
-	return putGroup(id, "", "", true, true)
-}
-
-func putGroup(id, name, description string, deleted, requireParticipant bool) error {
+// PutGroup implements `mage creategroup`/`mage updategroup <id> <name>`:
+// creates or updates (single step -- see shmevent.KindGroup's doc
+// comment) the Group record id=name on the current node. Only a current
+// raft voter may do this; pkg/daemon rejects it otherwise.
+func PutGroup(id, name string) error {
 	if err := validateCatalogID(id); err != nil {
 		return err
 	}
-	if requireParticipant {
-		if err := requireGroupParticipant(id); err != nil {
-			return err
-		}
-	}
-
 	ctx, cancel := context.WithTimeout(context.Background(), ipcTimeout)
 	defer cancel()
-	sess, selfPeerID, err := openCurrentSession(ctx)
+	sess, _, err := openCurrentSession(ctx)
 	if err != nil {
 		return err
 	}
-
-	fields := map[string]string{"name": name}
-	if deleted {
-		fields["deleted"] = "true"
-	}
-	if err := appendRecord(ctx, sess, logGroupKind, id, selfPeerID, fields, description); err != nil {
+	if err := sess.PutGroup(ctx, id, name); err != nil {
 		return fmt.Errorf("kvctl: put group: %w", err)
 	}
 	return nil
 }
 
-// GetGroup implements `mage getgroup <id>`: returns id's current
-// definition, or an error if it doesn't exist or was deleted.
+// DeleteGroup implements `mage deletegroup <id>`: deletes Group id,
+// cascading to every GroupCommand/PeerGroup record referencing it (see
+// kvfsm.OpCascadeDelete). Only a current raft voter may do this.
+func DeleteGroup(id string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), ipcTimeout)
+	defer cancel()
+	sess, _, err := openCurrentSession(ctx)
+	if err != nil {
+		return err
+	}
+	if err := sess.DeleteGroup(ctx, id); err != nil {
+		return fmt.Errorf("kvctl: delete group: %w", err)
+	}
+	return nil
+}
+
+// GetGroup implements `mage getgroup <id>`.
 func GetGroup(id string) (Group, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), ipcTimeout)
 	defer cancel()
@@ -363,20 +246,15 @@ func GetGroup(id string) (Group, error) {
 	if err != nil {
 		return Group{}, err
 	}
-
-	h, err := scanRevisions(ctx, sess, logGroupKind, id)
+	value, err := sess.Get(ctx, string(shmevent.GroupKey([]byte(id))))
 	if err != nil {
-		return Group{}, fmt.Errorf("kvctl: get group: %w", err)
-	}
-	if !h.found || h.latest.Fields["deleted"] == "true" {
 		return Group{}, fmt.Errorf("kvctl: group %s not found", id)
 	}
-	return recordToGroup(h), nil
+	return Group{ID: id, Name: shmevent.DecodeGroupPayload([]byte(value))}, nil
 }
 
-// ListGroups implements `mage listgroups`: returns every non-deleted
-// Group (nil, not an error, when none exist). No participation check --
-// see CreateGroup's doc comment.
+// ListGroups implements `mage listgroups`: returns every Group (nil, not
+// an error, when none exist).
 func ListGroups() ([]Group, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), ipcTimeout)
 	defer cancel()
@@ -384,209 +262,277 @@ func ListGroups() ([]Group, error) {
 	if err != nil {
 		return nil, err
 	}
-
-	ids, err := listUnitIDs(ctx, sess, logGroupKind)
-	if err != nil {
-		return nil, fmt.Errorf("kvctl: list groups: %w", err)
-	}
-
+	lo, hi := shmevent.GroupKeyBounds()
 	var groups []Group
-	for _, id := range ids {
-		h, err := scanRevisions(ctx, sess, logGroupKind, id)
+	for {
+		key, value, ok, err := sess.ListRange(ctx, lo, hi)
 		if err != nil {
 			return nil, fmt.Errorf("kvctl: list groups: %w", err)
 		}
-		if !h.found || h.latest.Fields["deleted"] == "true" {
-			continue
+		if !ok {
+			return groups, nil
 		}
-		groups = append(groups, recordToGroup(h))
+		if len(key) < systemKeyIDOffset {
+			return nil, fmt.Errorf("kvctl: malformed group key %x", key)
+		}
+		groups = append(groups, Group{ID: string(key[systemKeyIDOffset:]), Name: shmevent.DecodeGroupPayload(value)})
+		lo = append(append([]byte{}, key...), 0x00)
 	}
-	return groups, nil
 }
 
-// FormField describes one input a Command's submission form should
-// collect -- purely descriptive metadata for the calling UI to render a
-// form from; kvctl does not validate submitted values against it.
-type FormField struct {
-	Name     string   `json:"name"`
-	Label    string   `json:"label"`
-	Type     string   `json:"type"`
-	Required bool     `json:"required,omitempty"`
-	Options  []string `json:"options,omitempty"`
-}
-
-// Command is a single actionable operation belonging to a Group,
-// executed by TargetPeerID and described by FormSchema for the calling
-// UI to render an input form from -- kvctl does not itself interpret or
-// run a Command, only defines/discovers it (see SubmitCommand in
-// dispatch.go for dispatching and auditing one).
+// Command is a single submittable/executable operation: PeerID is where
+// it runs, gated by whichever groups it's linked to (CreateGroupCommand).
 type Command struct {
-	ID           string      `json:"id"`
-	GroupID      string      `json:"group_id"`
-	TargetPeerID string      `json:"target_peer_id"`
-	Name         string      `json:"name"`
-	Description  string      `json:"description"`
-	FormSchema   []FormField `json:"form_schema,omitempty"`
-	CreatedBy    string      `json:"created_by"`
-	CreatedAt    time.Time   `json:"created_at"`
-	UpdatedAt    time.Time   `json:"updated_at"`
+	ID     string `json:"id"`
+	Name   string `json:"name"`
+	PeerID string `json:"peer_id"`
 }
 
-func recordToCommand(h revisionHistory) (Command, error) {
-	rec := h.latest
-	c := Command{
-		ID:           rec.UnitID,
-		GroupID:      rec.Fields["group_id"],
-		TargetPeerID: rec.Fields["target_peer_id"],
-		Name:         rec.Fields["name"],
-		Description:  rec.Narrative,
-		CreatedBy:    h.createdBy,
-		CreatedAt:    h.createdAt,
-		UpdatedAt:    rec.Timestamp,
-	}
-	if schemaJSON := rec.Fields["form_schema"]; schemaJSON != "" {
-		if err := json.Unmarshal([]byte(schemaJSON), &c.FormSchema); err != nil {
-			return Command{}, fmt.Errorf("kvctl: decode form schema: %w", err)
-		}
-	}
-	return c, nil
-}
-
-// CreateCommand implements `mage createcommand <id> <groupID>
-// <targetPeerID> <name> <description> <formSchemaJSON>`: defines
-// commandID as belonging to groupID, executable by targetPeerID and
-// described by formSchema (nil for none) -- the calling UI renders its
-// submission form from that schema. Like CreateGroup/UpdateGroup, this
-// and UpdateCommand are the same append operation, just named for
-// intent. Requires the caller to already be a participant of groupID
-// (see IsGroupParticipant) -- unlike CreateGroup, Command writes are
-// always gated.
-func CreateCommand(id, groupID, targetPeerID, name, description string, formSchema []FormField) error {
-	return putCommand(id, groupID, targetPeerID, name, description, formSchema, false)
-}
-
-// UpdateCommand is CreateCommand's alias for the "this id already
-// exists" case -- see CreateCommand's doc comment.
-func UpdateCommand(id, groupID, targetPeerID, name, description string, formSchema []FormField) error {
-	return putCommand(id, groupID, targetPeerID, name, description, formSchema, false)
-}
-
-// DeleteCommand implements `mage deletecommand <groupID> <id>`: appends
-// a tombstone revision for id within groupID -- GetCommand/ListCommands
-// exclude it afterward. Requires the caller to already be a participant
-// of groupID.
-func DeleteCommand(groupID, id string) error {
-	return putCommand(id, groupID, "", "", "", nil, true)
-}
-
-func putCommand(id, groupID, targetPeerID, name, description string, formSchema []FormField, deleted bool) error {
+// PutCommand implements `mage createcommand`/`mage updatecommand <id>
+// <name> <peerID>`: creates or updates the Command record
+// id={name, peerID}. Only a current raft voter may do this.
+func PutCommand(id, name, peerID string) error {
 	if err := validateCatalogID(id); err != nil {
 		return err
 	}
-	if groupID == "" {
-		return fmt.Errorf("kvctl: command group_id must not be empty")
+	if peerID == "" {
+		return fmt.Errorf("kvctl: command peer_id must not be empty")
 	}
-	if err := requireGroupParticipant(groupID); err != nil {
-		return err
-	}
-	if !deleted && targetPeerID == "" {
-		return fmt.Errorf("kvctl: command target_peer_id must not be empty")
-	}
-
-	fields := map[string]string{
-		"group_id":       groupID,
-		"target_peer_id": targetPeerID,
-		"name":           name,
-	}
-	if deleted {
-		fields["deleted"] = "true"
-	} else if len(formSchema) > 0 {
-		schemaJSON, err := json.Marshal(formSchema)
-		if err != nil {
-			return fmt.Errorf("kvctl: encode form schema: %w", err)
-		}
-		fields["form_schema"] = string(schemaJSON)
-	}
-
 	ctx, cancel := context.WithTimeout(context.Background(), ipcTimeout)
 	defer cancel()
-	sess, selfPeerID, err := openCurrentSession(ctx)
+	sess, _, err := openCurrentSession(ctx)
 	if err != nil {
 		return err
 	}
-	if err := appendRecord(ctx, sess, commandLogKind(groupID), id, selfPeerID, fields, description); err != nil {
+	if err := sess.PutCommand(ctx, id, name, []byte(peerID)); err != nil {
 		return fmt.Errorf("kvctl: put command: %w", err)
 	}
 	return nil
 }
 
-// GetCommand implements `mage getcommand <groupID> <id>`: returns
-// commandID's current definition within groupID, or an error if it
-// doesn't exist, was deleted, or the caller isn't a participant of
-// groupID.
-func GetCommand(groupID, id string) (Command, error) {
-	if err := requireGroupParticipant(groupID); err != nil {
-		return Command{}, err
-	}
-
+// DeleteCommand implements `mage deletecommand <id>`: deletes Command id,
+// cascading to every GroupCommand record referencing it. Only a current
+// raft voter may do this.
+func DeleteCommand(id string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), ipcTimeout)
 	defer cancel()
 	sess, _, err := openCurrentSession(ctx)
 	if err != nil {
-		return Command{}, err
+		return err
 	}
-
-	h, err := scanRevisions(ctx, sess, commandLogKind(groupID), id)
-	if err != nil {
-		return Command{}, fmt.Errorf("kvctl: get command: %w", err)
+	if err := sess.DeleteCommand(ctx, id); err != nil {
+		return fmt.Errorf("kvctl: delete command: %w", err)
 	}
-	if !h.found || h.latest.Fields["deleted"] == "true" {
-		return Command{}, fmt.Errorf("kvctl: command %s not found in group %s", id, groupID)
-	}
-
-	cmd, err := recordToCommand(h)
-	if err != nil {
-		return Command{}, fmt.Errorf("kvctl: get command: %w", err)
-	}
-	return cmd, nil
+	return nil
 }
 
-// ListCommands implements `mage listcommands <groupID>`: returns every
-// non-deleted Command currently defined under groupID (nil, not an
-// error, when none exist), or an error if the caller isn't a participant
-// of groupID -- the binding behind "if the current node is a participant
-// of this group, it sees the list of available commands."
-func ListCommands(groupID string) ([]Command, error) {
-	if err := requireGroupParticipant(groupID); err != nil {
-		return nil, err
+// GetCommand implements `mage getcommand <id>`.
+func GetCommand(id string) (Command, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), ipcTimeout)
+	defer cancel()
+	sess, _, err := openCurrentSession(ctx)
+	if err != nil {
+		return Command{}, err
 	}
+	value, err := sess.Get(ctx, string(shmevent.CommandKey([]byte(id))))
+	if err != nil {
+		return Command{}, fmt.Errorf("kvctl: command %s not found", id)
+	}
+	name, peerID, err := shmevent.DecodeCommandPayload([]byte(value))
+	if err != nil {
+		return Command{}, fmt.Errorf("kvctl: decode command %s: %w", id, err)
+	}
+	return Command{ID: id, Name: name, PeerID: string(peerID)}, nil
+}
 
+// ListCommands implements `mage listcommands`: returns every Command
+// (nil, not an error, when none exist).
+func ListCommands() ([]Command, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), ipcTimeout)
 	defer cancel()
 	sess, _, err := openCurrentSession(ctx)
 	if err != nil {
 		return nil, err
 	}
-
-	ids, err := listUnitIDs(ctx, sess, commandLogKind(groupID))
-	if err != nil {
-		return nil, fmt.Errorf("kvctl: list commands: %w", err)
-	}
-
+	lo, hi := shmevent.CommandKeyBounds()
 	var commands []Command
-	for _, id := range ids {
-		h, err := scanRevisions(ctx, sess, commandLogKind(groupID), id)
+	for {
+		key, value, ok, err := sess.ListRange(ctx, lo, hi)
 		if err != nil {
 			return nil, fmt.Errorf("kvctl: list commands: %w", err)
 		}
-		if !h.found || h.latest.Fields["deleted"] == "true" {
-			continue
+		if !ok {
+			return commands, nil
 		}
-		cmd, err := recordToCommand(h)
+		if len(key) < systemKeyIDOffset {
+			return nil, fmt.Errorf("kvctl: malformed command key %x", key)
+		}
+		id := string(key[systemKeyIDOffset:])
+		name, peerID, err := shmevent.DecodeCommandPayload(value)
 		if err != nil {
-			return nil, fmt.Errorf("kvctl: list commands: %w", err)
+			return nil, fmt.Errorf("kvctl: list commands: decode %s: %w", id, err)
 		}
-		commands = append(commands, cmd)
+		commands = append(commands, Command{ID: id, Name: name, PeerID: string(peerID)})
+		lo = append(append([]byte{}, key...), 0x00)
 	}
-	return commands, nil
+}
+
+// CreateGroupCommand implements `mage addcommandtogroup <commandID>
+// <groupID>`: links commandID to groupID -- peers added to groupID
+// (AddPeerToGroup) become permitted to submit/execute commandID. Only a
+// current raft voter may do this.
+func CreateGroupCommand(commandID, groupID string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), ipcTimeout)
+	defer cancel()
+	sess, _, err := openCurrentSession(ctx)
+	if err != nil {
+		return err
+	}
+	if err := sess.PutGroupCommand(ctx, []byte(commandID), []byte(groupID)); err != nil {
+		return fmt.Errorf("kvctl: create group-command: %w", err)
+	}
+	return nil
+}
+
+// DeleteGroupCommand implements `mage removecommandfromgroup <commandID>
+// <groupID>`: unlinks commandID from groupID.
+func DeleteGroupCommand(commandID, groupID string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), ipcTimeout)
+	defer cancel()
+	sess, _, err := openCurrentSession(ctx)
+	if err != nil {
+		return err
+	}
+	if err := sess.DeleteGroupCommand(ctx, []byte(commandID), []byte(groupID)); err != nil {
+		return fmt.Errorf("kvctl: delete group-command: %w", err)
+	}
+	return nil
+}
+
+// ListGroupsForCommand implements `mage listgroupsforcommand <commandID>`:
+// returns every group id commandID is linked to.
+func ListGroupsForCommand(commandID string) ([]string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), ipcTimeout)
+	defer cancel()
+	sess, _, err := openCurrentSession(ctx)
+	if err != nil {
+		return nil, err
+	}
+	lo, hi, err := shmevent.GroupCommandBounds([]byte(commandID))
+	if err != nil {
+		return nil, err
+	}
+	var groupIDs []string
+	for {
+		key, _, ok, err := sess.ListRange(ctx, lo, hi)
+		if err != nil {
+			return nil, fmt.Errorf("kvctl: list groups for command: %w", err)
+		}
+		if !ok {
+			return groupIDs, nil
+		}
+		_, groupID, err := shmevent.ParseGroupCommandKey(key)
+		if err != nil {
+			return nil, err
+		}
+		groupIDs = append(groupIDs, string(groupID))
+		lo = append(append([]byte{}, key...), 0x00)
+	}
+}
+
+// AddPeerToGroup implements `mage addpeertogroup <peerID> <groupID>`:
+// grants peerID membership in groupID. Only a current raft voter may do
+// this.
+func AddPeerToGroup(peerID, groupID string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), ipcTimeout)
+	defer cancel()
+	sess, _, err := openCurrentSession(ctx)
+	if err != nil {
+		return err
+	}
+	if err := sess.PutPeerGroup(ctx, []byte(peerID), []byte(groupID)); err != nil {
+		return fmt.Errorf("kvctl: add peer to group: %w", err)
+	}
+	return nil
+}
+
+// RemovePeerFromGroup implements `mage removepeerfromgroup <peerID>
+// <groupID>`: revokes peerID's membership in groupID.
+func RemovePeerFromGroup(peerID, groupID string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), ipcTimeout)
+	defer cancel()
+	sess, _, err := openCurrentSession(ctx)
+	if err != nil {
+		return err
+	}
+	if err := sess.DeletePeerGroup(ctx, []byte(peerID), []byte(groupID)); err != nil {
+		return fmt.Errorf("kvctl: remove peer from group: %w", err)
+	}
+	return nil
+}
+
+// ListGroupsForPeer implements `mage listgroupsforpeer <peerID>`: returns
+// every group id peerID belongs to.
+func ListGroupsForPeer(peerID string) ([]string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), ipcTimeout)
+	defer cancel()
+	sess, _, err := openCurrentSession(ctx)
+	if err != nil {
+		return nil, err
+	}
+	lo, hi, err := shmevent.PeerGroupBounds([]byte(peerID))
+	if err != nil {
+		return nil, err
+	}
+	var groupIDs []string
+	for {
+		key, _, ok, err := sess.ListRange(ctx, lo, hi)
+		if err != nil {
+			return nil, fmt.Errorf("kvctl: list groups for peer: %w", err)
+		}
+		if !ok {
+			return groupIDs, nil
+		}
+		_, groupID, err := shmevent.ParsePeerGroupKey(key)
+		if err != nil {
+			return nil, err
+		}
+		groupIDs = append(groupIDs, string(groupID))
+		lo = append(append([]byte{}, key...), 0x00)
+	}
+}
+
+// isPermittedForCommand reports whether peerID may submit/execute
+// commandID: true if some group G satisfies both PeerGroup(peerID, G) and
+// GroupCommand(commandID, G). Scans GroupCommandBounds(commandID) first
+// (a command is expected to be linked to few groups, unlike a peer, which
+// may belong to many) and point-checks PeerGroupKey(peerID, group) for
+// each hit -- scan the smaller side, point-check the other -- the first
+// match short-circuits.
+func isPermittedForCommand(ctx context.Context, sess *shmclient.Session, peerID, commandID string) (bool, error) {
+	lo, hi, err := shmevent.GroupCommandBounds([]byte(commandID))
+	if err != nil {
+		return false, err
+	}
+	for {
+		key, _, ok, err := sess.ListRange(ctx, lo, hi)
+		if err != nil {
+			return false, err
+		}
+		if !ok {
+			return false, nil
+		}
+		_, groupID, err := shmevent.ParseGroupCommandKey(key)
+		if err != nil {
+			return false, err
+		}
+		peerGroupKey, err := shmevent.PeerGroupKey([]byte(peerID), groupID)
+		if err != nil {
+			return false, err
+		}
+		if _, err := sess.Get(ctx, string(peerGroupKey)); err == nil {
+			return true, nil
+		}
+		lo = append(append([]byte{}, key...), 0x00)
+	}
 }

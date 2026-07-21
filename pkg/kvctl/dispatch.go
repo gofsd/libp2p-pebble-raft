@@ -10,6 +10,7 @@ import (
 
 	"github.com/gofsd/libp2p-kv-raft/pkg/logrecord"
 	"github.com/gofsd/libp2p-kv-raft/pkg/shmclient"
+	"github.com/gofsd/libp2p-kv-raft/pkg/shmevent"
 )
 
 // This file is the desktop counterpart of mobile/kvmobile/dispatch.go:
@@ -45,12 +46,11 @@ import (
 const logCommandExecKind = "cmdlog"
 
 // commandRequestLogKind returns the pkg/logrecord Kind every
-// SubmitCommand dispatch (CommandRequest) belonging to groupID is stored
-// under -- same per-group-namespacing reasoning as commandLogKind in
-// catalog.go, so ListCommandRequests can enumerate a group's pending
-// requests with one prefix scan.
-func commandRequestLogKind(groupID string) string {
-	return "cmdreq:" + groupID
+// SubmitCommand dispatch (CommandRequest) of commandID is stored under,
+// so ListCommandRequests can enumerate a command's pending requests with
+// one prefix scan.
+func commandRequestLogKind(commandID string) string {
+	return "cmdreq:" + commandID
 }
 
 // commandExecIndexKind returns the pkg/logrecord Kind SubmitCommand
@@ -73,8 +73,8 @@ const (
 )
 
 // appendCommandExecIndex writes one commandExecIndexKind(peerID) entry
-// for instanceID, naming groupID/commandID and peerID's role in this
-// dispatch (execIndexRoleRequester/execIndexRoleTarget), attributed to
+// for instanceID, naming commandID and peerID's role in this dispatch
+// (execIndexRoleRequester/execIndexRoleTarget), attributed to
 // requesterPeerID -- SubmitCommand calls this once per role peerID plays
 // in a dispatch.
 //
@@ -91,9 +91,8 @@ const (
 // that budget the moment two real peer ids (~52 bytes each) were
 // involved at once -- see mobile/kvmobile/dispatch.go's identical doc
 // comment for the full story.
-func appendCommandExecIndex(ctx context.Context, sess *shmclient.Session, peerID, instanceID, groupID, commandID, requesterPeerID, role string) error {
+func appendCommandExecIndex(ctx context.Context, sess *shmclient.Session, peerID, instanceID, commandID, requesterPeerID, role string) error {
 	fields := map[string]string{
-		"group_id":   groupID,
 		"command_id": commandID,
 		"role":       role,
 	}
@@ -108,7 +107,6 @@ func appendCommandExecIndex(ctx context.Context, sess *shmclient.Session, peerID
 // neither exposes outside this file).
 type executePoke struct {
 	Type       string `json:"type"`
-	GroupID    string `json:"group_id,omitempty"`
 	CommandID  string `json:"command_id,omitempty"`
 	InstanceID string `json:"instance_id"`
 }
@@ -130,7 +128,6 @@ func newInstanceID() (string, error) {
 // writes.
 type CommandRequest struct {
 	InstanceID  string    `json:"instance_id"`
-	GroupID     string    `json:"group_id"`
 	CommandID   string    `json:"command_id"`
 	RequestedBy string    `json:"requested_by"`
 	Inputs      string    `json:"inputs,omitempty"` // caller-defined JSON, opaque to kvctl
@@ -140,7 +137,6 @@ type CommandRequest struct {
 func recordToCommandRequest(h revisionHistory) CommandRequest {
 	return CommandRequest{
 		InstanceID:  h.latest.UnitID,
-		GroupID:     h.latest.Fields["group_id"],
 		CommandID:   h.latest.Fields["command_id"],
 		RequestedBy: h.latest.AuthorPeerID,
 		Inputs:      h.latest.Fields["inputs"],
@@ -148,28 +144,34 @@ func recordToCommandRequest(h revisionHistory) CommandRequest {
 	}
 }
 
-// SubmitCommand implements `mage submitcommand <groupID> <commandID>
-// <inputsJSON>`: dispatches commandID (which must already exist in
-// groupID -- see CreateCommand) with inputsJSON (caller-defined, opaque
-// to kvctl -- typically the JSON object a form built from the Command's
-// FormSchema produced) as a durable, replicated CommandRequest, then
-// sends the command's TargetPeerID a low-latency Execute poke naming the
-// new instance id (best-effort: a failed poke doesn't fail the dispatch,
-// since the durable request is the real source of truth -- see
-// ListCommandRequests for the target's catch-up path if the poke never
-// arrives). Returns the instance id, which the caller uses with
-// GetCommandRequest/QueryCommandLog/LatestCommandLog to track this
-// specific dispatch. Requires the caller to already be a participant of
-// groupID.
+// SubmitCommand implements `mage submitcommand <commandID> <inputsJSON>`:
+// dispatches commandID (which must already exist -- see PutCommand) with
+// inputsJSON (caller-defined, opaque to kvctl) as a durable, replicated
+// CommandRequest, then sends the command's PeerID a low-latency Execute
+// poke naming the new instance id (best-effort: a failed poke doesn't
+// fail the dispatch, since the durable request is the real source of
+// truth -- see ListCommandRequests for the target's catch-up path if the
+// poke never arrives). Returns the instance id, which the caller uses
+// with GetCommandRequest/QueryCommandLog/LatestCommandLog to track this
+// specific dispatch and subscribe to its execution log.
+//
+// Requires the caller's own current peer id to be permitted for commandID
+// (isPermittedForCommand: some group both commandID is linked to via
+// CreateGroupCommand and the caller is a member of via AddPeerToGroup) --
+// this is the group-based ACL catalog's real enforcement point (see
+// catalog.go's doc comment); unlike the group participation check this
+// replaces, PutGroup/PutCommand/PutGroupCommand/PutPeerGroup themselves
+// are pkg/daemon-enforced (voter-gated), but this specific check --
+// "is the submitting peer currently entitled to this command" -- is still
+// evaluated here in kvctl, not independently inside pkg/daemon's generic
+// EventLogAppend handling, so it's only as strong as every caller
+// actually going through SubmitCommand rather than writing a
+// commandRequestLogKind record directly.
 //
 // kvctl only dispatches and records the request; actually running
 // commandID is the target's own application logic (see AppendCommandLog
 // for how it reports back).
-func SubmitCommand(groupID, commandID, inputsJSON string) (string, error) {
-	if err := requireGroupParticipant(groupID); err != nil {
-		return "", err
-	}
-
+func SubmitCommand(commandID, inputsJSON string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), ipcTimeout)
 	defer cancel()
 	sess, requesterPeerID, err := openCurrentSession(ctx)
@@ -177,14 +179,22 @@ func SubmitCommand(groupID, commandID, inputsJSON string) (string, error) {
 		return "", err
 	}
 
-	h, err := scanRevisions(ctx, sess, commandLogKind(groupID), commandID)
+	ok, err := isPermittedForCommand(ctx, sess, requesterPeerID, commandID)
 	if err != nil {
 		return "", fmt.Errorf("kvctl: submit command: %w", err)
 	}
-	if !h.found || h.latest.Fields["deleted"] == "true" {
-		return "", fmt.Errorf("kvctl: command %s not found in group %s", commandID, groupID)
+	if !ok {
+		return "", fmt.Errorf("kvctl: %s is not permitted to submit command %s", requesterPeerID, commandID)
 	}
-	targetPeerID := h.latest.Fields["target_peer_id"]
+
+	value, err := sess.Get(ctx, string(shmevent.CommandKey([]byte(commandID))))
+	if err != nil {
+		return "", fmt.Errorf("kvctl: command %s not found", commandID)
+	}
+	_, targetPeerID, err := shmevent.DecodeCommandPayload([]byte(value))
+	if err != nil {
+		return "", fmt.Errorf("kvctl: submit command: decode %s: %w", commandID, err)
+	}
 
 	instanceID, err := newInstanceID()
 	if err != nil {
@@ -192,43 +202,43 @@ func SubmitCommand(groupID, commandID, inputsJSON string) (string, error) {
 	}
 
 	fields := map[string]string{
-		"group_id":   groupID,
 		"command_id": commandID,
 	}
 	if inputsJSON != "" {
 		fields["inputs"] = inputsJSON
 	}
-	if err := appendRecord(ctx, sess, commandRequestLogKind(groupID), instanceID, requesterPeerID, fields, ""); err != nil {
+	if err := appendRecord(ctx, sess, commandRequestLogKind(commandID), instanceID, requesterPeerID, fields, ""); err != nil {
 		return "", fmt.Errorf("kvctl: submit command: %w", err)
 	}
 
-	if err := appendCommandExecIndex(ctx, sess, requesterPeerID, instanceID, groupID, commandID, requesterPeerID, execIndexRoleRequester); err != nil {
+	if err := appendCommandExecIndex(ctx, sess, requesterPeerID, instanceID, commandID, requesterPeerID, execIndexRoleRequester); err != nil {
 		return "", fmt.Errorf("kvctl: submit command: %w", err)
 	}
-	if targetPeerID != requesterPeerID {
-		if err := appendCommandExecIndex(ctx, sess, targetPeerID, instanceID, groupID, commandID, requesterPeerID, execIndexRoleTarget); err != nil {
+	targetPeerIDStr := string(targetPeerID)
+	if targetPeerIDStr != requesterPeerID {
+		if err := appendCommandExecIndex(ctx, sess, targetPeerIDStr, instanceID, commandID, requesterPeerID, execIndexRoleTarget); err != nil {
 			return "", fmt.Errorf("kvctl: submit command: %w", err)
 		}
 	}
 
-	if poke, err := json.Marshal(executePoke{Type: "cmd_req", GroupID: groupID, CommandID: commandID, InstanceID: instanceID}); err == nil {
-		_ = Execute(targetPeerID, string(poke))
+	if poke, err := json.Marshal(executePoke{Type: "cmd_req", CommandID: commandID, InstanceID: instanceID}); err == nil {
+		_ = Execute(targetPeerIDStr, string(poke))
 	}
 
 	return instanceID, nil
 }
 
-// GetCommandRequest implements `mage getcommandrequest <groupID>
-// <instanceID>`: returns instanceID's dispatch record within groupID, or
-// an error if it doesn't exist or the caller isn't a participant of
-// groupID. Typically used by the target after receiving a "cmd_req"
-// Execute poke (see executePoke), to learn which command and inputs it
-// names.
-func GetCommandRequest(groupID, instanceID string) (CommandRequest, error) {
-	if err := requireGroupParticipant(groupID); err != nil {
-		return CommandRequest{}, err
-	}
-
+// GetCommandRequest implements `mage getcommandrequest <commandID>
+// <instanceID>`: returns instanceID's dispatch record for commandID, or
+// an error if it doesn't exist. commandID is needed to know which storage
+// namespace to look in (commandRequestLogKind) -- typically already known
+// to the caller, since it's also named in the "cmd_req" Execute poke that
+// usually prompts this call (see executePoke). No separate ACL check here
+// beyond knowing commandID+instanceID (instanceID is a random 16-byte id,
+// shared only via the Execute poke or the requester) -- mirrors
+// QueryCommandLog/LatestCommandLog's own "possessing the id is the
+// credential" design.
+func GetCommandRequest(commandID, instanceID string) (CommandRequest, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), ipcTimeout)
 	defer cancel()
 	sess, _, err := openCurrentSession(ctx)
@@ -236,28 +246,24 @@ func GetCommandRequest(groupID, instanceID string) (CommandRequest, error) {
 		return CommandRequest{}, err
 	}
 
-	h, err := scanRevisions(ctx, sess, commandRequestLogKind(groupID), instanceID)
+	h, err := scanRevisions(ctx, sess, commandRequestLogKind(commandID), instanceID)
 	if err != nil {
 		return CommandRequest{}, fmt.Errorf("kvctl: get command request: %w", err)
 	}
 	if !h.found {
-		return CommandRequest{}, fmt.Errorf("kvctl: command request %s not found in group %s", instanceID, groupID)
+		return CommandRequest{}, fmt.Errorf("kvctl: command request %s not found for command %s", instanceID, commandID)
 	}
 	return recordToCommandRequest(h), nil
 }
 
-// ListCommandRequests implements `mage listcommandrequests <groupID>`:
-// returns every dispatch request currently recorded for groupID (nil,
+// ListCommandRequests implements `mage listcommandrequests <commandID>`:
+// returns every dispatch request currently recorded for commandID (nil,
 // not an error, when none exist), oldest first. How a target catches up
 // on requests it might have missed an Execute poke for -- pokes are
 // unreplicated and dropped if the target wasn't running to receive them
 // (see SubmitCommand's doc comment) -- e.g. on startup, or polled
 // periodically as a reliability fallback.
-func ListCommandRequests(groupID string) ([]CommandRequest, error) {
-	if err := requireGroupParticipant(groupID); err != nil {
-		return nil, err
-	}
-
+func ListCommandRequests(commandID string) ([]CommandRequest, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), ipcTimeout)
 	defer cancel()
 	sess, _, err := openCurrentSession(ctx)
@@ -265,14 +271,14 @@ func ListCommandRequests(groupID string) ([]CommandRequest, error) {
 		return nil, err
 	}
 
-	ids, err := listUnitIDs(ctx, sess, commandRequestLogKind(groupID))
+	ids, err := listUnitIDs(ctx, sess, commandRequestLogKind(commandID))
 	if err != nil {
 		return nil, fmt.Errorf("kvctl: list command requests: %w", err)
 	}
 
 	var requests []CommandRequest
 	for _, id := range ids {
-		h, err := scanRevisions(ctx, sess, commandRequestLogKind(groupID), id)
+		h, err := scanRevisions(ctx, sess, commandRequestLogKind(commandID), id)
 		if err != nil {
 			return nil, fmt.Errorf("kvctl: list command requests: %w", err)
 		}
@@ -297,11 +303,9 @@ const maxExecutionsByPeer = 200
 // peerID was on. The same instance appears twice, once under each role's
 // peer, if requester and target differ. TargetPeerID is "" for a
 // requester-role entry if this node could not resolve it (see
-// targetPeerIDForCommand) -- e.g. the command was since deleted, or this
-// node isn't a participant of that group.
+// targetPeerIDForCommand) -- e.g. the command was since deleted.
 type CommandExecution struct {
 	InstanceID   string    `json:"instance_id"`
-	GroupID      string    `json:"group_id"`
 	CommandID    string    `json:"command_id"`
 	RequestedBy  string    `json:"requested_by"`
 	TargetPeerID string    `json:"target_peer_id"`
@@ -309,20 +313,18 @@ type CommandExecution struct {
 	RequestedAt  time.Time `json:"requested_at"`
 }
 
-// targetPeerIDForCommand best-effort resolves commandID's current
-// TargetPeerID within groupID -- ListExecutionsByPeer's fallback for a
-// role-requester index entry, which (see appendCommandExecIndex's doc
-// comment on why the index is deliberately thin) doesn't store
-// target_peer_id itself. Returns "" rather than an error if the command
-// was since deleted or this node isn't (or is no longer) a participant
-// of groupID -- a missing detail on one history entry shouldn't fail the
-// whole list.
-func targetPeerIDForCommand(groupID, commandID string) string {
-	cmd, err := GetCommand(groupID, commandID)
+// targetPeerIDForCommand best-effort resolves commandID's current PeerID
+// -- ListExecutionsByPeer's fallback for a role-requester index entry,
+// which (see appendCommandExecIndex's doc comment on why the index is
+// deliberately thin) doesn't store the target peer id itself. Returns ""
+// rather than an error if the command was since deleted -- a missing
+// detail on one history entry shouldn't fail the whole list.
+func targetPeerIDForCommand(commandID string) string {
+	cmd, err := GetCommand(commandID)
 	if err != nil {
 		return ""
 	}
-	return cmd.TargetPeerID
+	return cmd.PeerID
 }
 
 // ListExecutionsByPeer implements `mage listexecutions <peerID>`:
@@ -370,11 +372,10 @@ func ListExecutionsByPeer(peerID string) ([]CommandExecution, error) {
 		if err != nil {
 			return nil, fmt.Errorf("kvctl: list executions by peer: decode: %w", err)
 		}
-		groupID, commandID := rec.Fields["group_id"], rec.Fields["command_id"]
+		commandID := rec.Fields["command_id"]
 
 		exec := CommandExecution{
 			InstanceID:  rec.UnitID,
-			GroupID:     groupID,
 			CommandID:   commandID,
 			RequestedBy: rec.AuthorPeerID,
 			RequestedAt: rec.Timestamp,
@@ -384,7 +385,7 @@ func ListExecutionsByPeer(peerID string) ([]CommandExecution, error) {
 			exec.TargetPeerID = peerID
 		} else {
 			exec.Role = "requester"
-			exec.TargetPeerID = targetPeerIDForCommand(groupID, commandID)
+			exec.TargetPeerID = targetPeerIDForCommand(commandID)
 		}
 
 		window = append(window, exec)

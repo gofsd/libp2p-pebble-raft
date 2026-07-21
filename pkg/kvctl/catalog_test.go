@@ -18,9 +18,8 @@ var fastRaftArgs = []string{
 }
 
 // pollUntilTrue retries check until it reports true, or fails the test
-// after timeout -- a write forwarded through raft (LogAppend, permit
-// request/confirm) becomes locally readable asynchronously, same reason
-// TestRequestConfirmPermitAcrossNodes already polls by hand.
+// after timeout -- every group-based ACL catalog write is a raft commit,
+// asynchronously visible to a subsequent local read.
 func pollUntilTrue(t *testing.T, timeout time.Duration, check func() (bool, error)) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
@@ -37,27 +36,10 @@ func pollUntilTrue(t *testing.T, timeout time.Duration, check func() (bool, erro
 	t.Fatalf("condition not met within %s (last error: %v)", timeout, lastErr)
 }
 
-// grantSelfParticipation makes leaderID (a single-node bootstrap leader,
-// hence always a raft voter) a confirmed participant of groupID --
-// request-then-confirm against itself, mirroring
-// mobile/kvmobile/catalog_test.go's identical helper.
-func grantSelfParticipation(t *testing.T, groupID, leaderID string) {
-	t.Helper()
-	if err := kvctl.RequestGroupParticipation(groupID, leaderID, ""); err != nil {
-		t.Fatalf("RequestGroupParticipation: %v", err)
-	}
-	pollUntilTrue(t, 10*time.Second, func() (bool, error) {
-		return true, kvctl.ConfirmGroupParticipation(groupID, leaderID)
-	})
-	pollUntilTrue(t, 10*time.Second, func() (bool, error) {
-		return kvctl.IsGroupParticipant(groupID)
-	})
-}
-
-// TestGroupCRUD drives Create/Get/List/Update/Delete against a real,
-// single-node leader: Update/Delete must refuse before this node is a
-// confirmed participant of the group and succeed after, and Delete's
-// tombstone must exclude the group from both Get and List afterward.
+// TestGroupCRUD drives PutGroup/GetGroup/ListGroups/DeleteGroup against a
+// real, single-node leader -- always a raft voter, so every write here
+// succeeds unconditionally (no participation gate exists anymore, unlike
+// the old logrecord-based scheme -- see catalog.go's doc comment).
 func TestGroupCRUD(t *testing.T) {
 	root := repoRoot(t)
 	home := t.TempDir()
@@ -69,14 +51,13 @@ func TestGroupCRUD(t *testing.T) {
 	}
 	t.Cleanup(func() { killAllRegistered(t, reg) })
 
-	leaderID, err := kvctl.AddNodeWithArgs(root, fastRaftArgs)
-	if err != nil {
+	if _, err := kvctl.AddNodeWithArgs(root, fastRaftArgs); err != nil {
 		t.Fatalf("AddNode: %v", err)
 	}
 
 	const groupID = "grp-1"
-	if err := kvctl.CreateGroup(groupID, "Group One", "first group"); err != nil {
-		t.Fatalf("CreateGroup: %v", err)
+	if err := kvctl.PutGroup(groupID, "Group One"); err != nil {
+		t.Fatalf("PutGroup: %v", err)
 	}
 
 	var g kvctl.Group
@@ -85,7 +66,7 @@ func TestGroupCRUD(t *testing.T) {
 		g, err = kvctl.GetGroup(groupID)
 		return err == nil, err
 	})
-	if g.ID != groupID || g.Name != "Group One" || g.Description != "first group" {
+	if g.ID != groupID || g.Name != "Group One" {
 		t.Fatalf("GetGroup = %+v, unexpected", g)
 	}
 
@@ -102,14 +83,8 @@ func TestGroupCRUD(t *testing.T) {
 		return false, nil
 	})
 
-	if err := kvctl.UpdateGroup(groupID, "Renamed", "updated desc"); err == nil {
-		t.Fatalf("UpdateGroup before participation: want error, got none")
-	}
-
-	grantSelfParticipation(t, groupID, leaderID)
-
-	if err := kvctl.UpdateGroup(groupID, "Renamed", "updated desc"); err != nil {
-		t.Fatalf("UpdateGroup: %v", err)
+	if err := kvctl.PutGroup(groupID, "Renamed"); err != nil {
+		t.Fatalf("PutGroup (update): %v", err)
 	}
 	pollUntilTrue(t, 10*time.Second, func() (bool, error) {
 		var err error
@@ -119,9 +94,6 @@ func TestGroupCRUD(t *testing.T) {
 		}
 		return g.Name == "Renamed", nil
 	})
-	if g.Description != "updated desc" {
-		t.Fatalf("GetGroup after update Description = %q, want %q", g.Description, "updated desc")
-	}
 
 	if err := kvctl.DeleteGroup(groupID); err != nil {
 		t.Fatalf("DeleteGroup: %v", err)
@@ -144,53 +116,7 @@ func TestGroupCRUD(t *testing.T) {
 	})
 }
 
-// TestGroupParticipationLifecycle drives IsGroupParticipant/
-// RequestGroupParticipation/ConfirmGroupParticipation/
-// RevokeGroupParticipation end to end.
-func TestGroupParticipationLifecycle(t *testing.T) {
-	root := repoRoot(t)
-	home := t.TempDir()
-	t.Setenv(registry.EnvHome, home)
-
-	reg, err := registry.Open()
-	if err != nil {
-		t.Fatalf("registry.Open: %v", err)
-	}
-	t.Cleanup(func() { killAllRegistered(t, reg) })
-
-	leaderID, err := kvctl.AddNodeWithArgs(root, fastRaftArgs)
-	if err != nil {
-		t.Fatalf("AddNode: %v", err)
-	}
-
-	const groupID = "grp-participation"
-
-	ok, err := kvctl.IsGroupParticipant(groupID)
-	if err != nil {
-		t.Fatalf("IsGroupParticipant (before): %v", err)
-	}
-	if ok {
-		t.Fatalf("IsGroupParticipant (before) = true, want false")
-	}
-
-	grantSelfParticipation(t, groupID, leaderID)
-
-	if err := kvctl.RevokeGroupParticipation(groupID, leaderID); err != nil {
-		t.Fatalf("RevokeGroupParticipation: %v", err)
-	}
-	pollUntilTrue(t, 10*time.Second, func() (bool, error) {
-		ok, err := kvctl.IsGroupParticipant(groupID)
-		if err != nil {
-			return false, err
-		}
-		return !ok, nil
-	})
-}
-
-// TestCommandCRUD drives Create/Get/List/Update/Delete for Commands,
-// including the participation gate (unlike Group, every Command
-// operation -- reads included -- requires it) and the FormSchema
-// round-trip.
+// TestCommandCRUD drives PutCommand/GetCommand/ListCommands/DeleteCommand.
 func TestCommandCRUD(t *testing.T) {
 	root := repoRoot(t)
 	home := t.TempDir()
@@ -207,34 +133,22 @@ func TestCommandCRUD(t *testing.T) {
 		t.Fatalf("AddNode: %v", err)
 	}
 
-	const groupID = "grp-cmds"
-
-	if err := kvctl.CreateCommand("cmd-1", groupID, leaderID, "Reboot", "restart the device", nil); err == nil {
-		t.Fatalf("CreateCommand before participation: want error, got none")
-	}
-
-	grantSelfParticipation(t, groupID, leaderID)
-
-	schema := []kvctl.FormField{{Name: "delay_seconds", Label: "Delay (seconds)", Type: "number", Required: true}}
-	if err := kvctl.CreateCommand("cmd-1", groupID, leaderID, "Reboot", "restart the device", schema); err != nil {
-		t.Fatalf("CreateCommand: %v", err)
+	if err := kvctl.PutCommand("cmd-1", "Reboot", leaderID); err != nil {
+		t.Fatalf("PutCommand: %v", err)
 	}
 
 	var cmd kvctl.Command
 	pollUntilTrue(t, 10*time.Second, func() (bool, error) {
 		var err error
-		cmd, err = kvctl.GetCommand(groupID, "cmd-1")
+		cmd, err = kvctl.GetCommand("cmd-1")
 		return err == nil, err
 	})
-	if cmd.Name != "Reboot" || cmd.TargetPeerID != leaderID || cmd.GroupID != groupID {
+	if cmd.Name != "Reboot" || cmd.PeerID != leaderID {
 		t.Fatalf("GetCommand = %+v, unexpected", cmd)
-	}
-	if len(cmd.FormSchema) != 1 || cmd.FormSchema[0].Name != "delay_seconds" {
-		t.Fatalf("GetCommand FormSchema = %+v, want one field named delay_seconds", cmd.FormSchema)
 	}
 
 	pollUntilTrue(t, 10*time.Second, func() (bool, error) {
-		commands, err := kvctl.ListCommands(groupID)
+		commands, err := kvctl.ListCommands()
 		if err != nil {
 			return false, err
 		}
@@ -246,44 +160,41 @@ func TestCommandCRUD(t *testing.T) {
 		return false, nil
 	})
 
-	if err := kvctl.UpdateCommand("cmd-1", groupID, leaderID, "Reboot Now", "restart immediately", nil); err != nil {
-		t.Fatalf("UpdateCommand: %v", err)
+	if err := kvctl.PutCommand("cmd-1", "Reboot Now", leaderID); err != nil {
+		t.Fatalf("PutCommand (update): %v", err)
 	}
 	pollUntilTrue(t, 10*time.Second, func() (bool, error) {
-		fresh, err := kvctl.GetCommand(groupID, "cmd-1")
+		fresh, err := kvctl.GetCommand("cmd-1")
 		if err != nil {
 			return false, err
 		}
 		cmd = fresh
 		return cmd.Name == "Reboot Now", nil
 	})
-	if len(cmd.FormSchema) != 0 {
-		t.Fatalf("GetCommand after update FormSchema = %+v, want empty (update passed no schema)", cmd.FormSchema)
-	}
 
-	if err := kvctl.DeleteCommand(groupID, "cmd-1"); err != nil {
+	if err := kvctl.DeleteCommand("cmd-1"); err != nil {
 		t.Fatalf("DeleteCommand: %v", err)
 	}
 	pollUntilTrue(t, 10*time.Second, func() (bool, error) {
-		_, err := kvctl.GetCommand(groupID, "cmd-1")
+		_, err := kvctl.GetCommand("cmd-1")
 		return err != nil, nil
 	})
 	pollUntilTrue(t, 10*time.Second, func() (bool, error) {
-		commands, err := kvctl.ListCommands(groupID)
+		commands, err := kvctl.ListCommands()
 		if err != nil {
 			return false, err
 		}
 		return len(commands) == 0, nil
 	})
-
-	if _, err := kvctl.ListCommands("some-other-group-never-joined"); err == nil {
-		t.Fatalf("ListCommands for non-participant group: want error, got none")
-	}
 }
 
-// TestCatalogEmptyListsAreEmptyArrays checks ListGroups/ListCommands
-// return a zero-length (nil) slice, not an error, when nothing matches.
-func TestCatalogEmptyListsAreEmptyArrays(t *testing.T) {
+// TestGroupCommandAndPeerGroupLinkingGatesSubmitCommand drives the full
+// group-based ACL chain end to end: a peer with no PeerGroup membership
+// at all must be refused by SubmitCommand; linking commandID to a group
+// (CreateGroupCommand) alone still isn't enough; adding the peer to that
+// group (AddPeerToGroup) is what finally permits it; removing the peer
+// from the group revokes access again.
+func TestGroupCommandAndPeerGroupLinkingGatesSubmitCommand(t *testing.T) {
 	root := repoRoot(t)
 	home := t.TempDir()
 	t.Setenv(registry.EnvHome, home)
@@ -299,6 +210,199 @@ func TestCatalogEmptyListsAreEmptyArrays(t *testing.T) {
 		t.Fatalf("AddNode: %v", err)
 	}
 
+	if err := kvctl.PutGroup("grp-1", "Group One"); err != nil {
+		t.Fatalf("PutGroup: %v", err)
+	}
+	if err := kvctl.PutCommand("cmd-1", "Reboot", leaderID); err != nil {
+		t.Fatalf("PutCommand: %v", err)
+	}
+	pollUntilTrue(t, 10*time.Second, func() (bool, error) {
+		_, err := kvctl.GetCommand("cmd-1")
+		return err == nil, nil
+	})
+
+	if _, err := kvctl.SubmitCommand("cmd-1", ""); err == nil {
+		t.Fatalf("SubmitCommand before any group link: want error, got none")
+	}
+
+	if err := kvctl.CreateGroupCommand("cmd-1", "grp-1"); err != nil {
+		t.Fatalf("CreateGroupCommand: %v", err)
+	}
+	pollUntilTrue(t, 10*time.Second, func() (bool, error) {
+		groupIDs, err := kvctl.ListGroupsForCommand("cmd-1")
+		if err != nil {
+			return false, err
+		}
+		return len(groupIDs) == 1 && groupIDs[0] == "grp-1", nil
+	})
+
+	// Linked to a group, but leaderID isn't a member of it yet.
+	if _, err := kvctl.SubmitCommand("cmd-1", ""); err == nil {
+		t.Fatalf("SubmitCommand before peer joined the group: want error, got none")
+	}
+
+	if err := kvctl.AddPeerToGroup(leaderID, "grp-1"); err != nil {
+		t.Fatalf("AddPeerToGroup: %v", err)
+	}
+	pollUntilTrue(t, 10*time.Second, func() (bool, error) {
+		groupIDs, err := kvctl.ListGroupsForPeer(leaderID)
+		if err != nil {
+			return false, err
+		}
+		return len(groupIDs) == 1 && groupIDs[0] == "grp-1", nil
+	})
+
+	var instanceID string
+	pollUntilTrue(t, 10*time.Second, func() (bool, error) {
+		var err error
+		instanceID, err = kvctl.SubmitCommand("cmd-1", `{"delay":5}`)
+		return err == nil, err
+	})
+	if instanceID == "" {
+		t.Fatalf("SubmitCommand returned empty instance id")
+	}
+
+	if err := kvctl.RemovePeerFromGroup(leaderID, "grp-1"); err != nil {
+		t.Fatalf("RemovePeerFromGroup: %v", err)
+	}
+	pollUntilTrue(t, 10*time.Second, func() (bool, error) {
+		_, err := kvctl.SubmitCommand("cmd-1", "")
+		return err != nil, nil
+	})
+}
+
+// TestDeleteGroupCascadesToRelations checks DeleteGroup removes every
+// GroupCommand/PeerGroup record referencing it (kvfsm.OpCascadeDelete),
+// so a peer that was only permitted via the deleted group loses access,
+// and ListGroupsForCommand/ListGroupsForPeer no longer mention it.
+func TestDeleteGroupCascadesToRelations(t *testing.T) {
+	root := repoRoot(t)
+	home := t.TempDir()
+	t.Setenv(registry.EnvHome, home)
+
+	reg, err := registry.Open()
+	if err != nil {
+		t.Fatalf("registry.Open: %v", err)
+	}
+	t.Cleanup(func() { killAllRegistered(t, reg) })
+
+	leaderID, err := kvctl.AddNodeWithArgs(root, fastRaftArgs)
+	if err != nil {
+		t.Fatalf("AddNode: %v", err)
+	}
+
+	if err := kvctl.PutGroup("grp-cascade", "Cascade Group"); err != nil {
+		t.Fatalf("PutGroup: %v", err)
+	}
+	if err := kvctl.PutCommand("cmd-cascade", "Reboot", leaderID); err != nil {
+		t.Fatalf("PutCommand: %v", err)
+	}
+	pollUntilTrue(t, 10*time.Second, func() (bool, error) {
+		_, err := kvctl.GetCommand("cmd-cascade")
+		return err == nil, nil
+	})
+	if err := kvctl.CreateGroupCommand("cmd-cascade", "grp-cascade"); err != nil {
+		t.Fatalf("CreateGroupCommand: %v", err)
+	}
+	if err := kvctl.AddPeerToGroup(leaderID, "grp-cascade"); err != nil {
+		t.Fatalf("AddPeerToGroup: %v", err)
+	}
+	pollUntilTrue(t, 10*time.Second, func() (bool, error) {
+		_, err := kvctl.SubmitCommand("cmd-cascade", "")
+		return err == nil, err
+	})
+
+	if err := kvctl.DeleteGroup("grp-cascade"); err != nil {
+		t.Fatalf("DeleteGroup: %v", err)
+	}
+
+	pollUntilTrue(t, 10*time.Second, func() (bool, error) {
+		groupIDs, err := kvctl.ListGroupsForCommand("cmd-cascade")
+		if err != nil {
+			return false, err
+		}
+		return len(groupIDs) == 0, nil
+	})
+	pollUntilTrue(t, 10*time.Second, func() (bool, error) {
+		groupIDs, err := kvctl.ListGroupsForPeer(leaderID)
+		if err != nil {
+			return false, err
+		}
+		return len(groupIDs) == 0, nil
+	})
+	if _, err := kvctl.SubmitCommand("cmd-cascade", ""); err == nil {
+		t.Fatalf("SubmitCommand after group cascade-deleted: want error, got none")
+	}
+}
+
+// TestDeleteCommandCascadesToGroupCommand checks DeleteCommand removes
+// every GroupCommand record referencing it.
+func TestDeleteCommandCascadesToGroupCommand(t *testing.T) {
+	root := repoRoot(t)
+	home := t.TempDir()
+	t.Setenv(registry.EnvHome, home)
+
+	reg, err := registry.Open()
+	if err != nil {
+		t.Fatalf("registry.Open: %v", err)
+	}
+	t.Cleanup(func() { killAllRegistered(t, reg) })
+
+	leaderID, err := kvctl.AddNodeWithArgs(root, fastRaftArgs)
+	if err != nil {
+		t.Fatalf("AddNode: %v", err)
+	}
+
+	if err := kvctl.PutGroup("grp-cmd-cascade", "Group"); err != nil {
+		t.Fatalf("PutGroup: %v", err)
+	}
+	if err := kvctl.PutCommand("cmd-to-delete", "Reboot", leaderID); err != nil {
+		t.Fatalf("PutCommand: %v", err)
+	}
+	pollUntilTrue(t, 10*time.Second, func() (bool, error) {
+		_, err := kvctl.GetCommand("cmd-to-delete")
+		return err == nil, nil
+	})
+	if err := kvctl.CreateGroupCommand("cmd-to-delete", "grp-cmd-cascade"); err != nil {
+		t.Fatalf("CreateGroupCommand: %v", err)
+	}
+	pollUntilTrue(t, 10*time.Second, func() (bool, error) {
+		groupIDs, err := kvctl.ListGroupsForCommand("cmd-to-delete")
+		if err != nil {
+			return false, err
+		}
+		return len(groupIDs) == 1, nil
+	})
+
+	if err := kvctl.DeleteCommand("cmd-to-delete"); err != nil {
+		t.Fatalf("DeleteCommand: %v", err)
+	}
+	pollUntilTrue(t, 10*time.Second, func() (bool, error) {
+		groupIDs, err := kvctl.ListGroupsForCommand("cmd-to-delete")
+		if err != nil {
+			return false, err
+		}
+		return len(groupIDs) == 0, nil
+	})
+}
+
+// TestCatalogEmptyListsAreEmptyArrays checks ListGroups/ListCommands
+// return a zero-length (nil) slice, not an error, when nothing matches.
+func TestCatalogEmptyListsAreEmptyArrays(t *testing.T) {
+	root := repoRoot(t)
+	home := t.TempDir()
+	t.Setenv(registry.EnvHome, home)
+
+	reg, err := registry.Open()
+	if err != nil {
+		t.Fatalf("registry.Open: %v", err)
+	}
+	t.Cleanup(func() { killAllRegistered(t, reg) })
+
+	if _, err := kvctl.AddNodeWithArgs(root, fastRaftArgs); err != nil {
+		t.Fatalf("AddNode: %v", err)
+	}
+
 	groups, err := kvctl.ListGroups()
 	if err != nil {
 		t.Fatalf("ListGroups: %v", err)
@@ -307,8 +411,7 @@ func TestCatalogEmptyListsAreEmptyArrays(t *testing.T) {
 		t.Fatalf("ListGroups (empty) = %+v, want none", groups)
 	}
 
-	grantSelfParticipation(t, "empty-group", leaderID)
-	commands, err := kvctl.ListCommands("empty-group")
+	commands, err := kvctl.ListCommands()
 	if err != nil {
 		t.Fatalf("ListCommands: %v", err)
 	}
@@ -317,8 +420,8 @@ func TestCatalogEmptyListsAreEmptyArrays(t *testing.T) {
 	}
 }
 
-// TestCatalogIDValidation checks CreateGroup rejects an empty or
-// oversized id before ever touching the daemon.
+// TestCatalogIDValidation checks PutGroup rejects an empty or oversized
+// id before ever touching the daemon.
 func TestCatalogIDValidation(t *testing.T) {
 	root := repoRoot(t)
 	home := t.TempDir()
@@ -334,14 +437,14 @@ func TestCatalogIDValidation(t *testing.T) {
 		t.Fatalf("AddNode: %v", err)
 	}
 
-	if err := kvctl.CreateGroup("", "x", "y"); err == nil {
-		t.Fatalf("CreateGroup with empty id: want error, got none")
+	if err := kvctl.PutGroup("", "x"); err == nil {
+		t.Fatalf("PutGroup with empty id: want error, got none")
 	}
 	oversized := make([]byte, 257)
 	for i := range oversized {
 		oversized[i] = 'a'
 	}
-	if err := kvctl.CreateGroup(string(oversized), "x", "y"); err == nil {
-		t.Fatalf("CreateGroup with oversized id: want error, got none")
+	if err := kvctl.PutGroup(string(oversized), "x"); err == nil {
+		t.Fatalf("PutGroup with oversized id: want error, got none")
 	}
 }

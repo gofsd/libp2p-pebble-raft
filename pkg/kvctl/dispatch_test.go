@@ -33,19 +33,29 @@ func TestSubmitCommandIndexesExecutionsByPeer(t *testing.T) {
 	const groupID = "grp-exec"
 	const targetPeerID = "some-target-peer-id"
 
-	grantSelfParticipation(t, groupID, leaderID)
-	if err := kvctl.CreateCommand("cmd-1", groupID, targetPeerID, "Reboot", "restart", nil); err != nil {
-		t.Fatalf("CreateCommand: %v", err)
+	if err := kvctl.PutGroup(groupID, "Exec Group"); err != nil {
+		t.Fatalf("PutGroup: %v", err)
+	}
+	if err := kvctl.PutCommand("cmd-1", "Reboot", targetPeerID); err != nil {
+		t.Fatalf("PutCommand: %v", err)
+	}
+	if err := kvctl.CreateGroupCommand("cmd-1", groupID); err != nil {
+		t.Fatalf("CreateGroupCommand: %v", err)
+	}
+	if err := kvctl.AddPeerToGroup(leaderID, groupID); err != nil {
+		t.Fatalf("AddPeerToGroup: %v", err)
 	}
 	pollUntilTrue(t, 10*time.Second, func() (bool, error) {
-		_, err := kvctl.GetCommand(groupID, "cmd-1")
+		_, err := kvctl.GetCommand("cmd-1")
 		return err == nil, nil
 	})
 
-	instanceID, err := kvctl.SubmitCommand(groupID, "cmd-1", `{"delay":5}`)
-	if err != nil {
-		t.Fatalf("SubmitCommand: %v", err)
-	}
+	var instanceID string
+	pollUntilTrue(t, 10*time.Second, func() (bool, error) {
+		var err error
+		instanceID, err = kvctl.SubmitCommand("cmd-1", `{"delay":5}`)
+		return err == nil, err
+	})
 	if instanceID == "" {
 		t.Fatalf("SubmitCommand returned empty instance id")
 	}
@@ -70,7 +80,7 @@ func TestSubmitCommandIndexesExecutionsByPeer(t *testing.T) {
 		return ok, nil
 	})
 	if requesterEntry.Role != "requester" || requesterEntry.RequestedBy != leaderID ||
-		requesterEntry.TargetPeerID != targetPeerID || requesterEntry.GroupID != groupID || requesterEntry.CommandID != "cmd-1" {
+		requesterEntry.TargetPeerID != targetPeerID || requesterEntry.CommandID != "cmd-1" {
 		t.Fatalf("ListExecutionsByPeer(requester) entry = %+v, unexpected", requesterEntry)
 	}
 
@@ -110,19 +120,29 @@ func TestSubmitCommandSelfTargetWritesOneIndexEntry(t *testing.T) {
 
 	const groupID = "grp-self-target"
 
-	grantSelfParticipation(t, groupID, leaderID)
-	if err := kvctl.CreateCommand("cmd-self", groupID, leaderID, "Self", "", nil); err != nil {
-		t.Fatalf("CreateCommand: %v", err)
+	if err := kvctl.PutGroup(groupID, "Self Target Group"); err != nil {
+		t.Fatalf("PutGroup: %v", err)
+	}
+	if err := kvctl.PutCommand("cmd-self", "Self", leaderID); err != nil {
+		t.Fatalf("PutCommand: %v", err)
+	}
+	if err := kvctl.CreateGroupCommand("cmd-self", groupID); err != nil {
+		t.Fatalf("CreateGroupCommand: %v", err)
+	}
+	if err := kvctl.AddPeerToGroup(leaderID, groupID); err != nil {
+		t.Fatalf("AddPeerToGroup: %v", err)
 	}
 	pollUntilTrue(t, 10*time.Second, func() (bool, error) {
-		_, err := kvctl.GetCommand(groupID, "cmd-self")
+		_, err := kvctl.GetCommand("cmd-self")
 		return err == nil, nil
 	})
 
-	instanceID, err := kvctl.SubmitCommand(groupID, "cmd-self", "")
-	if err != nil {
-		t.Fatalf("SubmitCommand: %v", err)
-	}
+	var instanceID string
+	pollUntilTrue(t, 10*time.Second, func() (bool, error) {
+		var err error
+		instanceID, err = kvctl.SubmitCommand("cmd-self", "")
+		return err == nil, err
+	})
 
 	var execs []kvctl.CommandExecution
 	pollUntilTrue(t, 10*time.Second, func() (bool, error) {

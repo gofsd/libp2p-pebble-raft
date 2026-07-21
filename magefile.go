@@ -1194,34 +1194,29 @@ func parseTimeWindow(since, until, limit string) (start, end time.Time, n int, e
 	return start, end, n, nil
 }
 
-// CreateGroup implements `mage creategroup <id> <name> <description>`:
-// defines a new command group, publicly listable by any cluster member --
-// see pkg/kvctl.CreateGroup's doc comment.
-// Usage: mage creategroup <id> <name> <description>
-func CreateGroup(id, name, description string) error {
-	if err := kvctl.CreateGroup(id, name, description); err != nil {
+// PutGroup implements `mage creategroup`/`mage updategroup <id> <name>`:
+// creates or updates the Group record id=name -- see
+// pkg/kvctl.PutGroup's doc comment. Only a current raft voter may do this.
+// Usage: mage creategroup <id> <name>
+func CreateGroup(id, name string) error {
+	if err := kvctl.PutGroup(id, name); err != nil {
 		return err
 	}
-	fmt.Println("✅ group created")
+	fmt.Println("✅ group put")
 	return nil
 }
 
-// UpdateGroup implements `mage updategroup <id> <name> <description>`:
-// appends a new name/description revision for an existing group. Requires
-// the current node to already be a participant of id.
-// Usage: mage updategroup <id> <name> <description>
-func UpdateGroup(id, name, description string) error {
-	if err := kvctl.UpdateGroup(id, name, description); err != nil {
-		return err
-	}
-	fmt.Println("✅ group updated")
-	return nil
+// UpdateGroup is CreateGroup's alias for the "this id already exists"
+// case -- see pkg/kvctl.PutGroup's doc comment (single-step Put, no
+// separate create/update distinction).
+// Usage: mage updategroup <id> <name>
+func UpdateGroup(id, name string) error {
+	return CreateGroup(id, name)
 }
 
-// DeleteGroup implements `mage deletegroup <id>`: tombstones a group so
-// GetGroup/ListGroups exclude it afterward (its Commands remain on disk,
-// just unreachable through the catalog). Requires the current node to
-// already be a participant of id.
+// DeleteGroup implements `mage deletegroup <id>`: deletes Group id,
+// cascading to every GroupCommand/PeerGroup record referencing it. Only a
+// current raft voter may do this.
 // Usage: mage deletegroup <id>
 func DeleteGroup(id string) error {
 	if err := kvctl.DeleteGroup(id); err != nil {
@@ -1247,8 +1242,8 @@ func GetGroup(id string) error {
 	return nil
 }
 
-// ListGroups implements `mage listgroups`: prints every non-deleted
-// Group, one JSON object per line.
+// ListGroups implements `mage listgroups`: prints every Group, one JSON
+// object per line.
 // Usage: mage listgroups
 func ListGroups() error {
 	groups, err := kvctl.ListGroups()
@@ -1265,125 +1260,81 @@ func ListGroups() error {
 	return nil
 }
 
-// IsGroupParticipant implements `mage isgroupparticipant <groupID>`:
-// prints "true"/"false" for whether the current node holds a confirmed
-// participation permit for groupID -- see pkg/kvctl.IsGroupParticipant's
-// doc comment.
-// Usage: mage isgroupparticipant <groupID>
-func IsGroupParticipant(groupID string) error {
-	ok, err := kvctl.IsGroupParticipant(groupID)
+// AddPeerToGroup implements `mage addpeertogroup <peerID> <groupID>`:
+// grants peerID membership in groupID -- peers in a group linked to a
+// command (see AddCommandToGroup) become permitted to submit/execute it.
+// Only a current raft voter may do this.
+// Usage: mage addpeertogroup <peerID> <groupID>
+func AddPeerToGroup(peerID, groupID string) error {
+	if err := kvctl.AddPeerToGroup(peerID, groupID); err != nil {
+		return err
+	}
+	fmt.Println("✅ peer added to group")
+	return nil
+}
+
+// RemovePeerFromGroup implements `mage removepeerfromgroup <peerID>
+// <groupID>`: revokes peerID's membership in groupID.
+// Usage: mage removepeerfromgroup <peerID> <groupID>
+func RemovePeerFromGroup(peerID, groupID string) error {
+	if err := kvctl.RemovePeerFromGroup(peerID, groupID); err != nil {
+		return err
+	}
+	fmt.Println("✅ peer removed from group")
+	return nil
+}
+
+// ListGroupsForPeer implements `mage listgroupsforpeer <peerID>`: prints
+// every group id peerID belongs to, one per line.
+// Usage: mage listgroupsforpeer <peerID>
+func ListGroupsForPeer(peerID string) error {
+	groupIDs, err := kvctl.ListGroupsForPeer(peerID)
 	if err != nil {
 		return err
 	}
-	fmt.Println(ok)
+	for _, id := range groupIDs {
+		fmt.Println(id)
+	}
 	return nil
 }
 
-// RequestGroupParticipation implements `mage requestgroupparticipation
-// <groupID> <peerID> <metadata>`: lodges a pending request for peerID to
-// participate in groupID -- a thin wrapper over `mage requestlogpermit`
-// under the hood (see pkg/kvctl.RequestGroupParticipation).
-// Usage: mage requestgroupparticipation <groupID> <peerID> <metadata>
-func RequestGroupParticipation(groupID, peerID, metadata string) error {
-	if err := kvctl.RequestGroupParticipation(groupID, peerID, metadata); err != nil {
+// PutCommand implements `mage createcommand`/`mage updatecommand <id>
+// <name> <peerID>`: creates or updates the Command record
+// id={name, peerID} (peerID is where it may be executed). Only a current
+// raft voter may do this.
+// Usage: mage createcommand <id> <name> <peerID>
+func CreateCommand(id, name, peerID string) error {
+	if err := kvctl.PutCommand(id, name, peerID); err != nil {
 		return err
 	}
-	fmt.Println("✅ participation requested")
+	fmt.Println("✅ command put")
 	return nil
 }
 
-// ConfirmGroupParticipation implements `mage confirmgroupparticipation
-// <groupID> <peerID>`: promotes a pending participation request to
-// confirmed. Only takes effect if the current node is itself a raft
-// voter.
-// Usage: mage confirmgroupparticipation <groupID> <peerID>
-func ConfirmGroupParticipation(groupID, peerID string) error {
-	if err := kvctl.ConfirmGroupParticipation(groupID, peerID); err != nil {
-		return err
-	}
-	fmt.Println("✅ participation confirmed")
-	return nil
+// UpdateCommand is CreateCommand's alias for the "this id already exists"
+// case.
+// Usage: mage updatecommand <id> <name> <peerID>
+func UpdateCommand(id, name, peerID string) error {
+	return CreateCommand(id, name, peerID)
 }
 
-// RevokeGroupParticipation implements `mage revokegroupparticipation <groupID>
-// <peerID>`: deletes a confirmed participation record outright.
-// Usage: mage revokegroupparticipation <groupID> <peerID>
-func RevokeGroupParticipation(groupID, peerID string) error {
-	if err := kvctl.RevokeGroupParticipation(groupID, peerID); err != nil {
-		return err
-	}
-	fmt.Println("✅ participation revoked")
-	return nil
-}
-
-// CreateCommand implements `mage createcommand <id> <groupID>
-// <targetPeerID> <name> <description> <formSchemaJSON>`: defines a
-// Command belonging to groupID, executed by targetPeerID. formSchemaJSON
-// is a JSON array of pkg/kvctl.FormField, or "" for none. Requires the
-// current node to already be a participant of groupID.
-// Usage: mage createcommand <id> <groupID> <targetPeerID> <name> <description> <formSchemaJSON>
-func CreateCommand(id, groupID, targetPeerID, name, description, formSchemaJSON string) error {
-	schema, err := decodeFormSchema(formSchemaJSON)
-	if err != nil {
-		return err
-	}
-	if err := kvctl.CreateCommand(id, groupID, targetPeerID, name, description, schema); err != nil {
-		return err
-	}
-	fmt.Println("✅ command created")
-	return nil
-}
-
-// UpdateCommand implements `mage updatecommand <id> <groupID>
-// <targetPeerID> <name> <description> <formSchemaJSON>`: CreateCommand's
-// alias for the "this id already exists" case -- see
-// pkg/kvctl.CreateCommand's doc comment.
-// Usage: mage updatecommand <id> <groupID> <targetPeerID> <name> <description> <formSchemaJSON>
-func UpdateCommand(id, groupID, targetPeerID, name, description, formSchemaJSON string) error {
-	schema, err := decodeFormSchema(formSchemaJSON)
-	if err != nil {
-		return err
-	}
-	if err := kvctl.UpdateCommand(id, groupID, targetPeerID, name, description, schema); err != nil {
-		return err
-	}
-	fmt.Println("✅ command updated")
-	return nil
-}
-
-// decodeFormSchema decodes formSchemaJSON (a JSON array of
-// pkg/kvctl.FormField, or "") for CreateCommand/UpdateCommand -- the same
-// "magefile decodes the JSON, kvctl takes a native value" split LogAppend
-// already uses for fieldsJSON.
-func decodeFormSchema(formSchemaJSON string) ([]kvctl.FormField, error) {
-	if formSchemaJSON == "" {
-		return nil, nil
-	}
-	var schema []kvctl.FormField
-	if err := json.Unmarshal([]byte(formSchemaJSON), &schema); err != nil {
-		return nil, fmt.Errorf("decode formSchemaJSON: %w", err)
-	}
-	return schema, nil
-}
-
-// DeleteCommand implements `mage deletecommand <groupID> <id>`:
-// tombstones a Command so GetCommand/ListCommands exclude it afterward.
-// Requires the current node to already be a participant of groupID.
-// Usage: mage deletecommand <groupID> <id>
-func DeleteCommand(groupID, id string) error {
-	if err := kvctl.DeleteCommand(groupID, id); err != nil {
+// DeleteCommand implements `mage deletecommand <id>`: deletes Command id,
+// cascading to every GroupCommand record referencing it. Only a current
+// raft voter may do this.
+// Usage: mage deletecommand <id>
+func DeleteCommand(id string) error {
+	if err := kvctl.DeleteCommand(id); err != nil {
 		return err
 	}
 	fmt.Println("✅ command deleted")
 	return nil
 }
 
-// GetCommand implements `mage getcommand <groupID> <id>`: prints id's
-// current definition within groupID as one JSON object. Requires the
-// current node to already be a participant of groupID.
-// Usage: mage getcommand <groupID> <id>
-func GetCommand(groupID, id string) error {
-	cmd, err := kvctl.GetCommand(groupID, id)
+// GetCommand implements `mage getcommand <id>`: prints id's current
+// definition as one JSON object.
+// Usage: mage getcommand <id>
+func GetCommand(id string) error {
+	cmd, err := kvctl.GetCommand(id)
 	if err != nil {
 		return err
 	}
@@ -1395,13 +1346,11 @@ func GetCommand(groupID, id string) error {
 	return nil
 }
 
-// ListCommands implements `mage listcommands <groupID>`: prints every
-// non-deleted Command currently defined under groupID, one JSON object
-// per line. Requires the current node to already be a participant of
-// groupID.
-// Usage: mage listcommands <groupID>
-func ListCommands(groupID string) error {
-	commands, err := kvctl.ListCommands(groupID)
+// ListCommands implements `mage listcommands`: prints every Command, one
+// JSON object per line.
+// Usage: mage listcommands
+func ListCommands() error {
+	commands, err := kvctl.ListCommands()
 	if err != nil {
 		return err
 	}
@@ -1415,13 +1364,54 @@ func ListCommands(groupID string) error {
 	return nil
 }
 
-// SubmitCommand implements `mage submitcommand <groupID> <commandID>
-// <inputsJSON>`: dispatches commandID as a durable, replicated request
-// plus a low-latency Execute poke to its TargetPeerID, and prints the new
-// instance id -- see pkg/kvctl.SubmitCommand's doc comment.
-// Usage: mage submitcommand <groupID> <commandID> <inputsJSON>
-func SubmitCommand(groupID, commandID, inputsJSON string) error {
-	instanceID, err := kvctl.SubmitCommand(groupID, commandID, inputsJSON)
+// AddCommandToGroup implements `mage addcommandtogroup <commandID>
+// <groupID>`: links commandID to groupID -- peers added to groupID
+// (AddPeerToGroup) become permitted to submit/execute commandID. Only a
+// current raft voter may do this.
+// Usage: mage addcommandtogroup <commandID> <groupID>
+func AddCommandToGroup(commandID, groupID string) error {
+	if err := kvctl.CreateGroupCommand(commandID, groupID); err != nil {
+		return err
+	}
+	fmt.Println("✅ command linked to group")
+	return nil
+}
+
+// RemoveCommandFromGroup implements `mage removecommandfromgroup
+// <commandID> <groupID>`: unlinks commandID from groupID.
+// Usage: mage removecommandfromgroup <commandID> <groupID>
+func RemoveCommandFromGroup(commandID, groupID string) error {
+	if err := kvctl.DeleteGroupCommand(commandID, groupID); err != nil {
+		return err
+	}
+	fmt.Println("✅ command unlinked from group")
+	return nil
+}
+
+// ListGroupsForCommand implements `mage listgroupsforcommand
+// <commandID>`: prints every group id commandID is linked to, one per
+// line.
+// Usage: mage listgroupsforcommand <commandID>
+func ListGroupsForCommand(commandID string) error {
+	groupIDs, err := kvctl.ListGroupsForCommand(commandID)
+	if err != nil {
+		return err
+	}
+	for _, id := range groupIDs {
+		fmt.Println(id)
+	}
+	return nil
+}
+
+// SubmitCommand implements `mage submitcommand <commandID> <inputsJSON>`:
+// dispatches commandID as a durable, replicated request plus a
+// low-latency Execute poke to its PeerID, and prints the new instance id
+// -- see pkg/kvctl.SubmitCommand's doc comment. Requires the current
+// node's own peer id to be permitted for commandID (some group both
+// commandID is linked to and the current node is a member of).
+// Usage: mage submitcommand <commandID> <inputsJSON>
+func SubmitCommand(commandID, inputsJSON string) error {
+	instanceID, err := kvctl.SubmitCommand(commandID, inputsJSON)
 	if err != nil {
 		return err
 	}
@@ -1429,12 +1419,12 @@ func SubmitCommand(groupID, commandID, inputsJSON string) error {
 	return nil
 }
 
-// GetCommandRequest implements `mage getcommandrequest <groupID>
-// <instanceID>`: prints instanceID's dispatch record within groupID as
-// one JSON object.
-// Usage: mage getcommandrequest <groupID> <instanceID>
-func GetCommandRequest(groupID, instanceID string) error {
-	req, err := kvctl.GetCommandRequest(groupID, instanceID)
+// GetCommandRequest implements `mage getcommandrequest <commandID>
+// <instanceID>`: prints instanceID's dispatch record for commandID as one
+// JSON object.
+// Usage: mage getcommandrequest <commandID> <instanceID>
+func GetCommandRequest(commandID, instanceID string) error {
+	req, err := kvctl.GetCommandRequest(commandID, instanceID)
 	if err != nil {
 		return err
 	}
@@ -1446,13 +1436,13 @@ func GetCommandRequest(groupID, instanceID string) error {
 	return nil
 }
 
-// ListCommandRequests implements `mage listcommandrequests <groupID>`:
-// prints every dispatch request currently recorded for groupID, oldest
+// ListCommandRequests implements `mage listcommandrequests <commandID>`:
+// prints every dispatch request currently recorded for commandID, oldest
 // first, one JSON object per line -- the target's catch-up path for a
 // missed Execute poke.
-// Usage: mage listcommandrequests <groupID>
-func ListCommandRequests(groupID string) error {
-	requests, err := kvctl.ListCommandRequests(groupID)
+// Usage: mage listcommandrequests <commandID>
+func ListCommandRequests(commandID string) error {
+	requests, err := kvctl.ListCommandRequests(commandID)
 	if err != nil {
 		return err
 	}
