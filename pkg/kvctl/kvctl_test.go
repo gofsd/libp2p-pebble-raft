@@ -148,6 +148,95 @@ func TestAddSetGetAcrossNodes(t *testing.T) {
 	}
 }
 
+// TestRangeScan drives kvctl.RangeScan/RangeScanFrom against a real
+// (spawned) node: writes a handful of keys, some sharing a prefix and one
+// deliberately outside it, then checks a scan over just that prefix's
+// range returns exactly the matching keys in ascending byte order, that
+// limit caps the result count, and that RangeScanFrom targets an explicit
+// peer id without disturbing "current".
+func TestRangeScan(t *testing.T) {
+	root := repoRoot(t)
+	home := t.TempDir()
+	t.Setenv(registry.EnvHome, home)
+
+	reg, err := registry.Open()
+	if err != nil {
+		t.Fatalf("registry.Open: %v", err)
+	}
+	t.Cleanup(func() { killAllRegistered(t, reg) })
+
+	fastRaftArgs := []string{
+		"-raft-heartbeat-timeout", "300ms",
+		"-raft-election-timeout", "300ms",
+		"-raft-leader-lease-timeout", "250ms",
+	}
+
+	leaderID, err := kvctl.AddNodeWithArgs(root, fastRaftArgs)
+	if err != nil {
+		t.Fatalf("AddNode (leader): %v", err)
+	}
+	if err := kvctl.Use(leaderID); err != nil {
+		t.Fatalf("Use(leader): %v", err)
+	}
+
+	for _, kv := range [][2]string{
+		{"scan:a", "1"},
+		{"scan:b", "2"},
+		{"scan:c", "3"},
+		{"zzz-outside-the-range", "should not appear"},
+	} {
+		if err := kvctl.Set(kv[0], kv[1]); err != nil {
+			t.Fatalf("Set(%s): %v", kv[0], err)
+		}
+	}
+
+	results, err := kvctl.RangeScan("scan:", "scan:\xff", 0)
+	if err != nil {
+		t.Fatalf("RangeScan: %v", err)
+	}
+	want := []kvctl.KV{
+		{Key: "scan:a", Value: "1"},
+		{Key: "scan:b", Value: "2"},
+		{Key: "scan:c", Value: "3"},
+	}
+	if len(results) != len(want) {
+		t.Fatalf("RangeScan returned %d results, want %d: %+v", len(results), len(want), results)
+	}
+	for i, w := range want {
+		if results[i] != w {
+			t.Fatalf("RangeScan result[%d] = %+v, want %+v", i, results[i], w)
+		}
+	}
+
+	limited, err := kvctl.RangeScan("scan:", "scan:\xff", 2)
+	if err != nil {
+		t.Fatalf("RangeScan (limit=2): %v", err)
+	}
+	if len(limited) != 2 {
+		t.Fatalf("RangeScan (limit=2) returned %d results, want 2: %+v", len(limited), limited)
+	}
+	if limited[0] != want[0] || limited[1] != want[1] {
+		t.Fatalf("RangeScan (limit=2) = %+v, want first 2 of %+v", limited, want)
+	}
+
+	// RangeScanFrom targets leaderID explicitly, whether or not it's
+	// "current" -- switch current away first to prove that.
+	otherID, err := kvctl.AddNodeWithArgs(root, fastRaftArgs)
+	if err != nil {
+		t.Fatalf("AddNode (other): %v", err)
+	}
+	if err := kvctl.Use(otherID); err != nil {
+		t.Fatalf("Use(other): %v", err)
+	}
+	fromLeader, err := kvctl.RangeScanFrom(leaderID, "scan:", "scan:\xff", 0)
+	if err != nil {
+		t.Fatalf("RangeScanFrom(leader): %v", err)
+	}
+	if len(fromLeader) != len(want) {
+		t.Fatalf("RangeScanFrom(leader) returned %d results, want %d: %+v", len(fromLeader), len(want), fromLeader)
+	}
+}
+
 // freePort finds a TCP port that's free at the moment of the call, for
 // pinning a node's -listen-port so it can be reliably resumed on the same
 // address later. Racy in principle (another process could grab it before

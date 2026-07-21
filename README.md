@@ -142,6 +142,17 @@ a peer joins/leaves or its own leadership status changes). Both are also exposed
 (`listclusters` / `listnodes <peerID>`), printing one JSON object per line the same way `logquery`
 does.
 
+`mage rangescan <start> <end> [limit]` is the generic counterpart to `set`/`get`: instead of one
+key at a time, it lists every key/value pair in `[start, end]` (both inclusive, lexicographic byte
+order over the raw key bytes) on the current node, one JSON object per line. It isn't scoped to
+just ordinary data — it can see this project's own reserved namespaces too
+(`shmevent.SystemKeyPrefix`, `pkg/logrecord`'s prefix) — but that's not a new privilege: every
+`kvctl`/`kvctl-cli` call only ever reaches the *local* daemon over shmring IPC, the same
+same-machine trust boundary `set`/`get` already operate under (see `pkg/shmevent`'s package doc
+comment), so a local caller already had unrestricted read access to its own node's entire store;
+this just exposes it conveniently instead of requiring a raw `sendevent` call. Also exposed on
+`kvctl-cli` as `rangescan <start> <end> [-limit N]`.
+
 #### Changing which cluster a node belongs to: `join`/`leave`/`rm`
 
 `addnode`/`addfollower` above always mint a *new* identity. `mage join <targetPeerID>` instead
@@ -234,6 +245,11 @@ is currently joined to — since unlike desktop's `registry.json` there's no per
 every cluster this identity has ever joined to enumerate; `ListClusterMembers()` needs no peer-id
 argument (there's only ever one running daemon to ask) and returns that one cluster's full live
 membership the same way desktop's `listnodes` does.
+
+`RangeScan(start, end, limit)` is the Android counterpart of desktop's `rangescan`: a JSON array of
+every key/value pair in `[start, end]` on this device's own locally replicated state, up to `limit`
+results (`0` = unlimited) — the same generic complement to `Submit`/`Get` desktop's version is to
+`set`/`get`, under the same "a local caller already has full read access to its own daemon" scope.
 
 `Kvmobile` also binds the permit and direct-notification desktop commands, against whichever
 device is currently running (Start's session, same as Submit/Get): `RequestPermit`/`ConfirmPermit`/

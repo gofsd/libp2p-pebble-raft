@@ -43,6 +43,7 @@ mage listclusters                                # show every raft cluster known
 mage listnodes <peerID>                          # query a running node for its cluster's full live peer id list
 mage set <key> <value>
 mage get <key>
+mage rangescan <start> <end> [limit|""]           # list every key/value pair in [start, end] on the current node
 ```
 
 `listclusters` is a pure local registry read (grouped by whichever peer id originally bootstrapped each
@@ -51,6 +52,14 @@ machine has itself created or joined a node into, never a network-wide view. `li
 contrast, needs `peerID` to actually be running: it queries that node's own locally-replicated
 `shmevent.KindClusterMember` records for its raft cluster's current live membership (every voter/
 learner/leader, including peers this machine never created and so has no registry entry for at all).
+
+`rangescan <start> <end> [limit]` is the generic counterpart to `set`/`get`: it lists every key/value
+pair in `[start, end]` (both inclusive, lexicographic byte order over the raw key bytes) on the
+current node, not just one key at a time -- covering ordinary data as well as this project's own
+reserved namespaces (`shmevent.SystemKeyPrefix`, `pkg/logrecord`'s prefix), since a local caller
+already has unrestricted read access to its own node's entire store the same way `set`/`get` do
+(see `pkg/shmevent`'s doc comment on the shmring same-machine trust boundary) -- this isn't a new
+privilege, just a convenient way to exercise one that already existed via a raw `sendevent` call.
 
 Cluster-membership lifecycle targets (wrap `pkg/kvctl/cluster.go`; let the *current* node -- `mage use` --
 change which cluster it belongs to, rather than spawning a new identity the way `addnode`/`addfollower`

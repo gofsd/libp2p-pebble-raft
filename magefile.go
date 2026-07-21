@@ -972,6 +972,39 @@ func Get(key string) error {
 	return nil
 }
 
+// RangeScan lists every key/value pair between start and end (both
+// inclusive, lexicographic byte order over the raw key bytes) on the
+// current node's local state, one JSON object per line -- a generic
+// counterpart to set/get for inspecting a whole range of keys at once
+// instead of one at a time, covering any key in the store (ordinary data
+// as well as this project's own reserved namespaces -- see
+// kvctl.RangeScan's doc comment for why that's not a new privilege for a
+// local caller). limit is a count or "" (unlimited).
+//
+// Usage: mage rangescan <start> <end> [limit|""]
+func RangeScan(start, end, limit string) error {
+	n := 0
+	if limit != "" {
+		v, err := strconv.Atoi(limit)
+		if err != nil {
+			return fmt.Errorf("rangescan: invalid limit %q: %w", limit, err)
+		}
+		n = v
+	}
+	results, err := kvctl.RangeScan(start, end, n)
+	if err != nil {
+		return err
+	}
+	for _, kv := range results {
+		out, err := json.Marshal(kv)
+		if err != nil {
+			return err
+		}
+		fmt.Println(string(out))
+	}
+	return nil
+}
+
 // RequestPermit lodges a pending permit record for peerID on the current
 // node, forwarded to the leader like any other Set. metadata may be "" (a
 // dialable multiaddr for kind "bootstrap", unused for kind "peer" -- see

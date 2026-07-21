@@ -47,6 +47,8 @@ func main() {
 		cmdListClusters(os.Args[2:])
 	case "listnodes":
 		cmdListNodes(os.Args[2:])
+	case "rangescan":
+		cmdRangeScan(os.Args[2:])
 	case "requestpermit":
 		cmdRequestPermit(os.Args[2:])
 	case "confirmpermit":
@@ -84,6 +86,7 @@ func usage() {
   kvctl-cli get <key>
   kvctl-cli listclusters
   kvctl-cli listnodes <peerID>
+  kvctl-cli rangescan <start> <end> [-limit N]
   kvctl-cli requestpermit <kind: peer|bootstrap> <peerID> <metadata>
   kvctl-cli confirmpermit <kind: peer|bootstrap> <peerID>
   kvctl-cli revokepermit <kind: peer|bootstrap> <peerID>
@@ -224,6 +227,35 @@ func cmdGet(args []string) {
 		os.Exit(1)
 	}
 	fmt.Println(value)
+}
+
+// cmdRangeScan prints, one JSON object per line, every key/value pair
+// between start and end (both inclusive, lexicographic byte order) on the
+// current node -- kvctl.RangeScan, the generic counterpart to cmdSet/
+// cmdGet for a whole range of keys at once.
+func cmdRangeScan(args []string) {
+	fs := flag.NewFlagSet("rangescan", flag.ExitOnError)
+	limit := fs.Int("limit", 0, "maximum results to return (0 = unlimited)")
+	fs.Parse(args)
+
+	if fs.NArg() != 2 {
+		fmt.Fprintln(os.Stderr, "usage: kvctl-cli rangescan <start> <end> [-limit N]")
+		os.Exit(2)
+	}
+
+	results, err := kvctl.RangeScan(fs.Arg(0), fs.Arg(1), *limit)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "rangescan: %v\n", err)
+		os.Exit(1)
+	}
+	for _, kv := range results {
+		out, err := json.Marshal(kv)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "rangescan: encode result: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println(string(out))
+	}
 }
 
 // cmdListClusters prints, one JSON object per line, every raft cluster
