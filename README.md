@@ -216,16 +216,33 @@ The app's UI (`MainActivity`) is a thin wrapper over `Kvmobile.start/submit/get`
 up the daemon and joins the cluster, `submit`/`get` go through the daemon's IPC exactly like the
 desktop CLI, just over the Android shared-memory transport instead of named shared memory. Every
 `submit` is forwarded from this (never-leader) follower to whichever peer is currently leader,
+over `pkg/daemon.ForwardProtocolID`.
 
-`Kvmobile` runs exactly one daemon per process, so `Start(dataDir)`/`StartWithKey(dataDir, keyHex)`,
-`Stop()`, and `Delete(dataDir)` are the Android equivalents of desktop's `addnode`/`addnodewithkey`/
-`use`/`deletenode`, adapted to that constraint: `StartWithKey` provisions `dataDir`'s identity from
-an existing `identity.key`-format hex string at runtime instead of always minting a fresh one
-(refusing if `dataDir` already holds a *different* identity); `Stop` shuts the current daemon down
-so a different `dataDir`/identity can be started next — there's no multi-node registry to pick a
+`Kvmobile` runs exactly one daemon per process. `Start(dataDir)`/`StartWithKey(dataDir, keyHex)`
+bring it up joined to the build-time-baked-in leader — the Android equivalent of desktop's
+`addfollower`/`addfollowerwithkey`, not `addnode`/`addnodewithkey`: a phone can never bootstrap a
+*fresh* cluster as leader (`Start` errors out if no `leaderMultiaddr` was compiled in), so there's
+no kvmobile equivalent of `addnode` at all. `Start` also folds in what `resumenode`/`rejoinnode` do
+on desktop: it re-sends the join every call regardless of whether `dataDir`'s identity is fresh or
+already-persisted, since `raft.AddVoter` is a no-op-ish update for a peer id already in the
+configuration (see `Start`'s own doc comment for the same reasoning `pkg/kvctl.RejoinNode` uses).
+`StartWithKey` provisions `dataDir`'s identity from an existing `identity.key`-format hex string at
+runtime instead of always minting a fresh one (refusing if `dataDir` already holds a *different*
+identity, same guard `addnodewithkey` applies). `Stop()` shuts the current daemon down so a
+different `dataDir`/identity can be started next — there's no multi-node registry to pick a
 "current" one from the way desktop's `mage use <peerID>` does, so switching is just `Stop()` then
-`Start`/`StartWithKey` against the target directory; `Delete` wipes a `dataDir` outright and refuses
-while a daemon is running against it, same safety rule as `mage deletenode`.
+`Start`/`StartWithKey` against the target directory. `Delete(dataDir)` wipes a `dataDir` outright
+and refuses while a daemon is running against it, same safety rule as `mage deletenode`.
+
+`Join(dataDir, leaderAddr)`/`JoinWithKey(dataDir, keyHex, leaderAddr)` are the Android equivalent of
+desktop's `mage join <targetPeerID>`: switching this device onto a *different* cluster at runtime
+(`leaderAddr` a full multiaddr, e.g. typed by an operator or scanned from a QR code) rather than the
+one baked in at build time. Unlike `Start`, which no-ops if a daemon is already running, `Join`
+always stops whatever's currently running first and starts a fresh one against `leaderAddr` —
+switching clusters is the whole point of calling it. Joining back into a cluster this identity has
+belonged to before (matching leader peer id) picks its local raft state back up and lets raft's own
+snapshot/log replication catch it up on everything committed while it was away, exactly like
+`join`/`rejoinnode` do on desktop (see `pkg/daemon.TestOriginRejoinsClusterCatchesUpOnMissedWrites`).
 
 `Leave()` asks the cluster the currently-running device is joined to to remove it
 (`raft.RemoveServer` — a graceful shrink, the remaining voters keep operating normally) and then
@@ -323,10 +340,11 @@ requester-role entry instead) — because every `pkg/logrecord` write shares
 once for this index, via `commandExecIndexKind`) and value combined; an earlier version of this
 index stored both peer ids directly and blew that budget the moment two real ~52-byte peer ids
 were involved in the same dispatch.
-over `pkg/daemon.ForwardProtocolID`. `Kvmobile.sendEvent` (not used by `MainActivity`, only by the
-e2e pipeline's `E2ETest` instrumented test) exposes the same raw `pkg/shmevent` event dispatch
-`submit`/`get` are themselves built on, for tests that need the exact event kvctl-cli's `sendevent`
-can send on desktop/remote rather than only the higher-level Set/Get shape.
+
+`Kvmobile.sendEvent` (not used by `MainActivity`, only by the e2e pipeline's `E2ETest`
+instrumented test) exposes the same raw `pkg/shmevent` event dispatch `submit`/`get` are themselves
+built on, for tests that need the exact event kvctl-cli's `sendevent` can send on desktop/remote
+rather than only the higher-level Set/Get shape.
 
 **MIUI/Xiaomi devices**: `adb install` can fail with `INSTALL_FAILED_USER_RESTRICTED` even with
 "Unknown sources" allowed — there's a separate Developer Options toggle, **"Install via USB"**,
