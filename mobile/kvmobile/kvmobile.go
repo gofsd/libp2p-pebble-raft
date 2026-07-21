@@ -160,7 +160,16 @@ func start(dataDirRoot string, resolveIdentity func(dataDir string) (keyPath, pe
 	if leaderMultiaddr == "" {
 		return "", fmt.Errorf("kvmobile: no leader multiaddr baked in at build time")
 	}
+	return startAgainst(dataDirRoot, leaderMultiaddr, resolveIdentity)
+}
 
+// startAgainst is the shared "bring up the in-process daemon under
+// dataDirRoot and join it to leaderAddr" implementation behind both
+// start (Start/StartWithKey, always against the build-time leaderMultiaddr)
+// and join (Join/JoinWithKey, against a leaderAddr chosen at runtime) --
+// see Join's doc comment for why the runtime-switching case can't just
+// reuse start's own already-started short-circuit. Callers must hold mu.
+func startAgainst(dataDirRoot, leaderAddr string, resolveIdentity func(dataDir string) (keyPath, peerID string, err error)) (string, error) {
 	keyPath, id, err := resolveIdentity(dataDirRoot)
 	if err != nil {
 		return "", err
@@ -172,8 +181,10 @@ func start(dataDirRoot string, resolveIdentity func(dataDir string) (keyPath, pe
 	// cluster is active. This mirrors desktop's
 	// registry.NodeDataDir/ClusterDataDir split exactly (see that
 	// package's doc comments) so the same identity can hold separate,
-	// non-colliding state per cluster it has ever joined.
-	remotePID, err := registry.ExtractPeerID(leaderMultiaddr)
+	// non-colliding state per cluster it has ever joined -- switching
+	// leaderAddr to a different cluster (Join) lands in a different
+	// clusterDir than before, never overwriting the previous one's state.
+	remotePID, err := registry.ExtractPeerID(leaderAddr)
 	if err != nil {
 		return "", fmt.Errorf("kvmobile: resolve leader peer id: %w", err)
 	}
@@ -214,7 +225,7 @@ func start(dataDirRoot string, resolveIdentity func(dataDir string) (keyPath, pe
 		cancel()
 		return "", fmt.Errorf("kvmobile: fetch signing key: %w", err)
 	}
-	if _, err := sess.Add(addCtx, leaderMultiaddr); err != nil {
+	if _, err := sess.Add(addCtx, leaderAddr); err != nil {
 		cancel()
 		return "", fmt.Errorf("kvmobile: join cluster: %w", err)
 	}
@@ -227,6 +238,58 @@ func start(dataDirRoot string, resolveIdentity func(dataDir string) (keyPath, pe
 	cancelRun = cancel
 	started = true
 	return peerID, nil
+}
+
+// Join switches this device to a different raft cluster at runtime, given
+// leaderAddr (a full multiaddr including /p2p/<peerID>, e.g. typed by an
+// operator or scanned from a QR code) -- the kvmobile counterpart to
+// desktop's kvctl.Join, for the case Start/StartWithKey's build-time-only
+// leaderMultiaddr doesn't cover: switching which cluster this identity
+// belongs to without a new app build.
+//
+// Unlike Start, which is a no-op once already running, Join always stops
+// whatever daemon is currently running first (if any) and starts a fresh
+// one against leaderAddr instead -- switching clusters is the whole point
+// of calling it, so silently no-op'ing on an already-started node the way
+// Start does would defeat it.
+//
+// Like desktop's Join, this reuses AddNode's/rejoin's existing "join under
+// an existing identity" wire protocol as-is: whether admitted immediately
+// or only after a separate raft-voter confirmation depends entirely on
+// leaderAddr's own daemon's Config.RequireConfirmForJoin setting.
+//
+// The resulting cluster subdirectory is keyed off leaderAddr's own peer id
+// (see startAgainst), exactly like Start/StartWithKey key off the
+// build-time leader -- so Join-ing back into a cluster this identity has
+// belonged to before (matching remote peer id) picks its local raft state
+// back up and lets raft's own snapshot/log replication catch it up on
+// everything committed while it was away, rather than starting from
+// scratch. See pkg/daemon's TestOriginRejoinsClusterCatchesUpOnMissedWrites
+// for that guarantee proven end to end.
+func Join(dataDir, leaderAddr string) (string, error) {
+	return join(dataDir, leaderAddr, ensureIdentity)
+}
+
+// JoinWithKey is like Join but provisions dataDir's identity from keyHex
+// (see StartWithKey) instead of always falling back to ensureIdentity's
+// persisted-or-generated-or-build-seeded key.
+func JoinWithKey(dataDir, keyHex, leaderAddr string) (string, error) {
+	return join(dataDir, leaderAddr, func(dataDir string) (keyPath, peerID string, err error) {
+		return importIdentity(dataDir, keyHex)
+	})
+}
+
+func join(dataDir, leaderAddr string, resolveIdentity func(dataDir string) (keyPath, peerID string, err error)) (string, error) {
+	if leaderAddr == "" {
+		return "", fmt.Errorf("kvmobile: no target leader multiaddr given")
+	}
+	if err := Stop(); err != nil {
+		return "", fmt.Errorf("kvmobile: join: stop current node: %w", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	return startAgainst(dataDir, leaderAddr, resolveIdentity)
 }
 
 // Stop shuts down the currently running in-process daemon, if any, and
@@ -292,9 +355,10 @@ func Delete(dataDir string) error {
 // default cluster to fall back to here -- kvmobile's daemon always joins
 // leaderMultiaddr, baked in at build time (see this package's doc
 // comment) -- so a later Start/StartWithKey would simply attempt to
-// rejoin the very same cluster. Call Rm instead if that later rejoin
-// attempt should require fresh confirmation rather than being silently
-// re-admitted.
+// rejoin the very same cluster; call Join instead to pick a different one
+// at runtime. Call Rm instead of Leave if a later rejoin attempt against
+// this same cluster should require fresh confirmation rather than being
+// silently re-admitted.
 func Leave() error {
 	sess, err := currentSession()
 	if err != nil {

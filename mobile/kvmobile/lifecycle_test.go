@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	lp2pcrypto "github.com/libp2p/go-libp2p/core/crypto"
 
@@ -168,6 +169,100 @@ func TestStopThenStartSwitchesIdentity(t *testing.T) {
 	}
 	if got := PeerID(); got != secondID {
 		t.Fatalf("PeerID() after second Start = %s, want %s", got, secondID)
+	}
+}
+
+// TestJoinSwitchesClusterAtRuntime drives Join against two independent
+// real (in-process) leaders: it must move the same identity (same dataDir,
+// same persisted key -- unlike TestStopThenStartSwitchesIdentity, which
+// switches to a *different* identity) off the first cluster and onto the
+// second one, entirely at runtime, with no rebuild-with-a-new-ldflag step
+// -- the gap flagged against kvmobile's normally build-time-only
+// leaderMultiaddr (see package doc comment and Join's own doc comment).
+func TestJoinSwitchesClusterAtRuntime(t *testing.T) {
+	firstLeaderAddr := spawnTestLeader(t, t.TempDir())
+	secondLeaderAddr := spawnTestLeader(t, t.TempDir())
+	firstLeaderPeerID, err := registry.ExtractPeerID(firstLeaderAddr)
+	if err != nil {
+		t.Fatalf("ExtractPeerID (first): %v", err)
+	}
+	secondLeaderPeerID, err := registry.ExtractPeerID(secondLeaderAddr)
+	if err != nil {
+		t.Fatalf("ExtractPeerID (second): %v", err)
+	}
+
+	prevLeader := leaderMultiaddr
+	leaderMultiaddr = firstLeaderAddr
+	t.Cleanup(func() {
+		leaderMultiaddr = prevLeader
+		_ = Stop()
+	})
+
+	dataDirRoot := t.TempDir()
+	id, err := Start(dataDirRoot)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	ctx := context.Background()
+	memberKey := string(shmevent.ClusterMemberKey([]byte(id)))
+	if _, err := shmclient.Get(ctx, firstLeaderPeerID, memberKey); err != nil {
+		t.Fatalf("follower not a cluster member of first leader after Start: %v", err)
+	}
+	firstClusterDir := filepath.Join(dataDirRoot, registry.ClusterDirName(id, firstLeaderPeerID))
+	if _, err := os.Stat(firstClusterDir); err != nil {
+		t.Fatalf("first cluster dir %s missing after Start: %v", firstClusterDir, err)
+	}
+
+	gotID, err := Join(dataDirRoot, secondLeaderAddr)
+	if err != nil {
+		t.Fatalf("Join: %v", err)
+	}
+	if gotID != id {
+		t.Fatalf("Join peer id = %s, want %s (same identity as before, just a different cluster)", gotID, id)
+	}
+	if got := PeerID(); got != id {
+		t.Fatalf("PeerID() after Join = %s, want %s", got, id)
+	}
+	if _, err := shmclient.Get(ctx, secondLeaderPeerID, memberKey); err != nil {
+		t.Fatalf("follower not a cluster member of second leader after Join: %v", err)
+	}
+
+	// The first cluster's local data subdirectory is left alone (Join, like
+	// desktop's kvctl.Join, doesn't gracefully Leave the old cluster first,
+	// just stops the process and joins elsewhere -- exact parity with
+	// desktop's own join(), which only stopAndWait's, never leaveCluster's,
+	// the previous identity), and the second cluster gets its own distinct
+	// subdirectory rather than colliding with the first's.
+	if _, err := os.Stat(firstClusterDir); err != nil {
+		t.Fatalf("first cluster dir %s should still exist after Join: %v", firstClusterDir, err)
+	}
+	secondClusterDir := filepath.Join(dataDirRoot, registry.ClusterDirName(id, secondLeaderPeerID))
+	if secondClusterDir == firstClusterDir {
+		t.Fatalf("second cluster dir collides with first: %s", secondClusterDir)
+	}
+	if _, err := os.Stat(secondClusterDir); err != nil {
+		t.Fatalf("second cluster dir %s missing after Join: %v", secondClusterDir, err)
+	}
+
+	// Fully functional against the new cluster: a Submit through the device
+	// commits and reads back. Polled, not asserted immediately, since Get
+	// reads this follower's own locally replicated state, which can lag a
+	// moment behind a Submit that just committed on the leader (see
+	// TestJoinThroughRelay in pkg/daemon for the same pattern).
+	if err := Submit("k", "v"); err != nil {
+		t.Fatalf("Submit after Join: %v", err)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		got, err := Get("k")
+		if err == nil && got == "v" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("Get after Join never observed replicated value: err=%v value=%q", err, got)
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 }
 
